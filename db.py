@@ -74,6 +74,7 @@ def init_db():
         ("project_name", "TEXT NOT NULL DEFAULT 'Bot Principal'"),
         ("extra_files",  "JSONB NOT NULL DEFAULT '{}'"),
         ("env_vars",     "JSONB NOT NULL DEFAULT '{}'"),
+        ("assigned_port", "INTEGER DEFAULT NULL"),
     ]:
         cur.execute(f"ALTER TABLE projects ADD COLUMN IF NOT EXISTS {col} {defn}")
 
@@ -453,6 +454,42 @@ def set_all_bots_stopped(telegram_id: int):
     conn.commit()
     cur.close()
     conn.close()
+
+
+def get_bot_assigned_port(telegram_id: int, project_name: str) -> int | None:
+    """Retourne le port fixe assigné à ce bot (None si non encore assigné)."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute("SELECT assigned_port FROM projects WHERE telegram_id=%s AND project_name=%s",
+                (telegram_id, project_name))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["assigned_port"] if row else None
+
+
+def set_bot_assigned_port(telegram_id: int, project_name: str, port: int):
+    """Enregistre le port fixe assigné à ce bot."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        UPDATE projects SET assigned_port=%s
+        WHERE telegram_id=%s AND project_name=%s
+    """, (port, telegram_id, project_name))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_all_assigned_ports() -> set:
+    """Retourne l'ensemble de tous les ports déjà assignés (pour éviter les doublons)."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute("SELECT assigned_port FROM projects WHERE assigned_port IS NOT NULL")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {r["assigned_port"] for r in rows}
 
 def get_all_bots() -> list:
     conn = get_connection()

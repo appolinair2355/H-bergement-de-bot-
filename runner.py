@@ -14,6 +14,7 @@ from pathlib import Path
 from db import (
     get_bot, get_project, set_running, set_bot_running,
     get_all_bots, get_expired_running_bots,
+    get_bot_assigned_port, set_bot_assigned_port, get_all_assigned_ports,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,26 +27,70 @@ _send_message_callback = None
 # Port réservé par le dashboard (ne jamais le donner à un bot utilisateur)
 _DASHBOARD_PORT = int(os.environ.get("PORT", 10000))
 # Plage de ports attribués aux bots utilisateurs
+# Chaque utilisateur dispose d'un bloc de 20 ports
 _BOT_PORT_START = 11000
-_BOT_PORT_END   = 12000
+_BOT_PORT_END   = 13000   # 2000 ports = 100 utilisateurs × 20 bots max
+
+_port_lock = threading.Lock()
 
 
-def _find_free_port() -> int:
-    """Trouve un port libre dans la plage réservée aux bots utilisateurs."""
+def _is_port_free(port: int) -> bool:
+    """Vérifie si un port est libre sur la machine."""
     import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("", port))
+            return True
+        except OSError:
+            return False
+
+
+def _find_free_port(exclude: set = None) -> int:
+    """Trouve un port libre dans la plage, en excluant les ports déjà assignés."""
+    if exclude is None:
+        exclude = set()
+    exclude.add(_DASHBOARD_PORT)
     for port in range(_BOT_PORT_START, _BOT_PORT_END):
-        if port == _DASHBOARD_PORT:
+        if port in exclude:
             continue
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("", port))
-                return port
-            except OSError:
-                continue
-    # Fallback : laisser l'OS choisir
+        if _is_port_free(port):
+            return port
+    # Fallback OS
+    import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def _get_dedicated_port(telegram_id: int, project_name: str) -> int:
+    """
+    Retourne le port FIXE assigné à ce bot.
+    - Si déjà assigné en DB et libre → on le réutilise.
+    - Si déjà assigné mais occupé (redémarrage rapide) → on attend puis réessaie.
+    - Si jamais assigné → on choisit le prochain port libre
+      en évitant tous les ports déjà pris par d'autres bots.
+    Le port est ensuite persisté en DB pour ce bot.
+    """
+    with _port_lock:
+        stored = get_bot_assigned_port(telegram_id, project_name)
+
+        if stored is not None:
+            # Attendre jusqu'à 5 s que le port se libère (arrêt du process précédent)
+            for _ in range(10):
+                if _is_port_free(stored):
+                    logger.info(f"Port réutilisé pour {telegram_id}/{project_name}: {stored}")
+                    return stored
+                time.sleep(0.5)
+            # Le port est toujours occupé → trouver un nouveau
+            logger.warning(f"Port {stored} occupé pour {telegram_id}/{project_name}, réassignation")
+
+        # Trouver un port libre en évitant tous les ports déjà assignés en DB
+        taken = get_all_assigned_ports()
+        taken.add(_DASHBOARD_PORT)
+        port = _find_free_port(exclude=taken)
+        set_bot_assigned_port(telegram_id, project_name, port)
+        logger.info(f"Nouveau port assigné à {telegram_id}/{project_name}: {port}")
+        return port
 
 
 def set_send_callback(fn):
@@ -214,11 +259,10 @@ def start_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, st
         logger.warning(f"Pre-install check failed: {e}")
 
     env = os.environ.copy()
-    # Attribuer un port libre unique pour ce bot (évite les conflits avec le dashboard
-    # du bot manager et entre les bots eux-mêmes, quel que soit le port utilisé)
-    free_port = _find_free_port()
-    env["PORT"] = str(free_port)
-    logger.info(f"Port attribué au bot {telegram_id}/{project_name}: {free_port}")
+    # Port fixe dédié à ce bot (persisté en DB, jamais partagé avec un autre bot)
+    dedicated_port = _get_dedicated_port(telegram_id, project_name)
+    env["PORT"] = str(dedicated_port)
+    logger.info(f"Port attribué au bot {telegram_id}/{project_name}: {dedicated_port}")
     env.update({"TOKEN": api_token, "BOT_TOKEN": api_token,
                  "TELEGRAM_TOKEN": api_token, "API_TOKEN": api_token})
     for k, v in env_vars.items():
