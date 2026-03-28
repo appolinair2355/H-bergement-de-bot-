@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: telegram-bot-manager
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: ADMIN_TELEGRAM_IDS
+        value: "1190237801"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: RENDER_DATABASE_URL
+        sync: false
+      - key: PAYMENT_INFO
+        sync: false
+      - key: DASHBOARD_SECRET
+        sync: false

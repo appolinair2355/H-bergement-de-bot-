@@ -1,0 +1,32 @@
+# ── Serveur Bot Manager ──────────────────────────────────────────────────────
+python-telegram-bot==21.3
+psycopg2-binary
+flask
+httpx
+
+# ── Pré-installés pour les bots utilisateurs (disponibles sans délai) ────────
+# HTTP & réseau
+requests
+aiohttp
+
+# Chargement .env
+python-dotenv
+
+# Client Telegram MTProto (bots Telethon/Pyrogram)
+telethon
+
+# Traitement d'images
+Pillow
+
+# Web scraping
+beautifulsoup4
+lxml
+
+# Planification de tâches
+schedule
+
+# Chiffrement (dépendance telethon + bots crypto)
+pycryptodome
+
+# Production WSGI (Render.com)
+gunicorn
