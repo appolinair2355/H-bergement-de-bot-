@@ -118,7 +118,7 @@ def _welcome_keyboard(tid: int) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(rows)
 
-def _red_panel(profile: dict) -> tuple[str, InlineKeyboardMarkup]:
+def _red_panel(profile: dict, tid: int = None) -> tuple[str, InlineKeyboardMarkup]:
     sub_end = profile.get("subscription_end") if profile else None
     if sub_end:
         msg = (f"🔴 *Abonnement expiré*\n\n"
@@ -127,8 +127,15 @@ def _red_panel(profile: dict) -> tuple[str, InlineKeyboardMarkup]:
     else:
         msg = ("🔴 *Aucun abonnement actif*\n\n"
                "Choisissez une durée pour activer l'hébergement de votre bot.")
-    kb = [[InlineKeyboardButton("💳 Payer mon abonnement", callback_data="payer_info")]]
-    return msg, InlineKeyboardMarkup(kb)
+    # Boutons de navigation complets
+    rows = [[InlineKeyboardButton("💳 Payer mon abonnement", callback_data="payer_info")]]
+    if tid:
+        bots = get_user_bots(tid)
+        if bots:
+            rows.append([InlineKeyboardButton("📋 Mes Bots", callback_data="my_bots_list")])
+        rows.append([InlineKeyboardButton("🚀 Héberger un Bot",  callback_data="begin_setup")])
+    rows.append([InlineKeyboardButton("📖 Mode d'emploi", callback_data="guide")])
+    return msg, InlineKeyboardMarkup(rows)
 
 def _blue_panel(tid: int) -> tuple[str, InlineKeyboardMarkup]:
     profile = get_user_profile(tid) or {}
@@ -184,35 +191,85 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not profile:
         give_free_trial(tid)
         profile = get_user_profile(tid)
-        trial_notice = (
-            f"\n\n🎁 *Essai gratuit activé : {config.FREE_TRIAL_HOURS}h offerts !*\n"
-            "_Utilisez ce temps pour configurer et tester votre bot._"
+
+    # ── ADMIN : panneau d'administration complet ──────────────────────────────
+    if is_admin(tid):
+        bots      = get_user_bots(tid)
+        running_c = sum(1 for b in bots if b["is_running"])
+        nb        = len(bots)
+
+        # Description de chaque bot
+        bot_lines = ""
+        for b in bots:
+            ico = "🟢" if b["is_running"] else "🔴"
+            # Fichiers supplémentaires
+            extra = b.get("extra_files") or {}
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except Exception:
+                    extra = {}
+            n_files = len(extra)
+            file_info = f" (+{n_files} fichier{'s' if n_files > 1 else ''})" if n_files else ""
+            bot_lines += f"\n│ {ico} <b>{b['project_name']}</b>{file_info}"
+
+        msg = (
+            "🔑 <b>Panneau Administrateur</b>\n\n"
+            f"├ 🤖 Mes bots ({nb}) :{bot_lines if bot_lines else ' <i>aucun</i>'}\n"
+            f"└ 🟢 En ligne : <b>{running_c}/{nb}</b>"
         )
-    else:
-        trial_notice = ""
 
-    kb = _welcome_keyboard(tid)
+        # Boutons par bot : Démarrer/Arrêter + Télécharger
+        rows = []
+        for b in bots:
+            pname = b["project_name"]
+            btn_action = (
+                InlineKeyboardButton(f"⛔ {pname}", callback_data=f"stop:{pname}")
+                if b["is_running"] else
+                InlineKeyboardButton(f"🚀 {pname}", callback_data=f"deploy:{pname}")
+            )
+            btn_dl = InlineKeyboardButton("📥", callback_data=f"adl:{tid}:{pname}")
+            rows.append([btn_action, btn_dl])
 
+        # Boutons de navigation admin
+        rows += [
+            [InlineKeyboardButton("👥 Mes Utilisateurs",       callback_data="admin_users")],
+            [InlineKeyboardButton("➕ Héberger un Bot",         callback_data="begin_setup")],
+            [InlineKeyboardButton("⚙️ Config paiements",       callback_data="admin_pay_config")],
+            [InlineKeyboardButton("📖 Mode d'emploi",           callback_data="guide")],
+        ]
+        await update.message.reply_text(msg, parse_mode="HTML",
+                                        reply_markup=InlineKeyboardMarkup(rows))
+        return ConversationHandler.END
+
+    # ── Utilisateur connu avec nom enregistré ─────────────────────────────────
     if profile and (profile.get("nom") or "").strip():
-        # Utilisateur connu
         active = is_subscription_active(tid)
         if active:
             msg, kb2 = _blue_panel(tid)
             await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb2)
         else:
-            msg, kb2 = _red_panel(profile)
+            msg, kb2 = _red_panel(profile, tid)
+            prenom = (profile.get("prenom") or "").strip()
+            nom    = (profile.get("nom") or "").strip()
             await update.message.reply_text(
-                f"👋 Bon retour *{profile['prenom']} {profile['nom']}* !\n\n"
-                + msg, parse_mode="Markdown", reply_markup=kb2)
-    else:
-        await update.message.reply_text(
-            f"👋 *Bienvenue sur le Bot Manager !*\n\n"
-            "Je vous aide à héberger vos bots Telegram en quelques étapes."
-            f"{trial_notice}\n\n"
-            "Choisissez une option :",
-            parse_mode="Markdown",
-            reply_markup=kb,
-        )
+                f"👋 Bon retour *{prenom} {nom}* !\n\n" + msg,
+                parse_mode="Markdown", reply_markup=kb2)
+        return ConversationHandler.END
+
+    # ── Nouvel utilisateur ────────────────────────────────────────────────────
+    trial_notice = (
+        f"\n\n🎁 *Essai gratuit activé : {config.FREE_TRIAL_HOURS}h offerts !*\n"
+        "_Utilisez ce temps pour configurer et tester votre bot._"
+    )
+    await update.message.reply_text(
+        f"👋 *Bienvenue sur le Bot Manager !*\n\n"
+        "Je vous aide à héberger vos bots Telegram en quelques étapes."
+        f"{trial_notice}\n\n"
+        "Choisissez une option :",
+        parse_mode="Markdown",
+        reply_markup=_welcome_keyboard(tid),
+    )
     return ConversationHandler.END
 
 
@@ -917,14 +974,15 @@ async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     users = [p for p in profiles if p["telegram_id"] not in config.ADMIN_TELEGRAM_IDS]
 
     header = f"👥 <b>Utilisateurs ({len(users)})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    blocks = []
+    blocks   = []
+    dl_rows  = []   # boutons de téléchargement accumulés pour le clavier
 
     for p in users:
-        tid     = p["telegram_id"]
-        active  = is_subscription_active(tid)
-        pro     = is_pro_active(tid)
+        u_tid   = p["telegram_id"]
+        active  = is_subscription_active(u_tid)
+        pro     = is_pro_active(u_tid)
         trial   = p.get("trial_used", False)
-        bots    = get_user_bots(tid)
+        bots    = get_user_bots(u_tid)
         nb      = len(bots)
         sub_end = p.get("subscription_end")
         pro_end = p.get("pro_subscription_end")
@@ -941,45 +999,59 @@ async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             statut = "🆕 Aucun abonnement"
 
-        # Liste des bots
+        # Liste des bots avec fichiers
         if bots:
-            bots_lines = "\n".join(
-                f"    {'🟢' if b['is_running'] else '🔴'} <code>{b['project_name']}</code>"
-                for b in bots
-            )
+            bot_desc_lines = []
+            for b in bots:
+                ico   = "🟢" if b["is_running"] else "🔴"
+                extra = b.get("extra_files") or {}
+                if isinstance(extra, str):
+                    try:    extra = json.loads(extra)
+                    except: extra = {}
+                n_files   = len(extra)
+                file_info = f" +{n_files}f" if n_files else ""
+                bot_desc_lines.append(
+                    f"    {ico} <code>{b['project_name']}</code>{file_info}"
+                )
+                # Bouton téléchargement pour ce bot
+                pname_short = b["project_name"][:20]   # limite callback_data 64B
+                dl_cb = f"adl:{u_tid}:{pname_short}"
+                lbl   = f"📥 {pname_short} ({u_tid})"[:32]
+                dl_rows.append([InlineKeyboardButton(lbl, callback_data=dl_cb)])
+            bots_lines = "\n".join(bot_desc_lines)
         else:
             bots_lines = "    <i>Aucun bot</i>"
 
         name = f"{p.get('prenom', '')} {p.get('nom', '')}".strip() or "Sans nom"
         blocks.append(
             f"👤 <b>{name}</b>\n"
-            f"   ID : <code>{tid}</code> | {nb} bot(s)\n"
+            f"   ID : <code>{u_tid}</code> | {nb} bot(s)\n"
             f"   {statut}\n"
             f"{bots_lines}"
         )
 
-    # Découper en messages de max 3900 chars pour rester sous la limite Telegram
+    # Clavier final : boutons DL + retour
+    kb_rows  = dl_rows + [[InlineKeyboardButton("🔙 Retour", callback_data="back_home")]]
+    kb_final = InlineKeyboardMarkup(kb_rows)
+
+    # Découper en messages de max 3900 chars
     full_text = header + "\n\n".join(blocks)
     if len(full_text) <= 3900:
-        await q.edit_message_text(full_text, parse_mode="HTML", reply_markup=kb)
+        await q.edit_message_text(full_text, parse_mode="HTML", reply_markup=kb_final)
     else:
-        # Premier message : modifier le message existant
-        chunk, rest = "", blocks[:]
         await q.edit_message_text(header + "⏳ Chargement...", parse_mode="HTML")
         current = header
         msgs = []
-        for block in rest:
+        for block in blocks:
             if len(current) + len(block) + 4 > 3900:
                 msgs.append(current)
                 current = ""
             current += block + "\n\n"
         if current:
             msgs.append(current)
-
-        for i, msg in enumerate(msgs):
-            reply_markup = kb if i == len(msgs) - 1 else None
-            await q.message.reply_text(msg.strip(), parse_mode="HTML",
-                                        reply_markup=reply_markup)
+        for i, msg_text in enumerate(msgs):
+            rm = kb_final if i == len(msgs) - 1 else None
+            await q.message.reply_text(msg_text.strip(), parse_mode="HTML", reply_markup=rm)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1250,6 +1322,59 @@ async def dbinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 *Token dashboard :* `{config.DASHBOARD_SECRET}`",
         parse_mode="Markdown")
 
+# ── Helper partagé : construit le ZIP d'un projet en mémoire ─────────────────
+
+def _build_project_zip(bot_row: dict, target_tid: int) -> tuple[io.BytesIO, str, str]:
+    """Retourne (buf, filename, caption) pour un document Telegram."""
+    pname = bot_row["project_name"]
+
+    extra = bot_row.get("extra_files") or {}
+    if isinstance(extra, str):
+        try:    extra = json.loads(extra)
+        except: extra = {}
+
+    env_vars = bot_row.get("env_vars") or {}
+    if isinstance(env_vars, str):
+        try:    env_vars = json.loads(env_vars)
+        except: env_vars = {}
+
+    main_py = bot_row.get("main_py") or ""
+    n_extra = len(extra)
+    statut  = "🟢 actif" if bot_row.get("is_running") else "🔴 arrêté"
+
+    meta = (
+        f"# Projet    : {pname}\n"
+        f"# UserID    : {target_tid}\n"
+        f"# Token     : {bot_row.get('api_token','???')}\n"
+        f"# Créé le   : {bot_row.get('date_creation','—')}\n"
+        f"# Statut    : {statut}\n"
+        f"# Fichiers  : main.py"
+        + (", " + ", ".join(extra.keys()) if extra else "")
+        + "\n\n# Variables d'environnement :\n"
+        + "\n".join(f"# {k}={v}" for k, v in env_vars.items())
+        + "\n"
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("main.py", main_py)
+        for fname, content in extra.items():
+            if isinstance(content, str):
+                zf.writestr(fname, content)
+        zf.writestr("_META.txt", meta)
+    buf.seek(0)
+
+    safe   = "".join(c if c.isalnum() or c in "-_." else "_" for c in pname)
+    fname  = f"{safe}_{target_tid}.zip"
+    caption = (
+        f"📦 <b>{pname}</b> — user <code>{target_tid}</code>\n"
+        f"📁 <code>main.py</code>"
+        + (f" + {n_extra} fichier{'s' if n_extra > 1 else ''} supplémentaire{'s' if n_extra > 1 else ''}" if n_extra else "")
+        + f"\n🔑 <code>_META.txt</code> (token + variables)"
+    )
+    return buf, fname, caption
+
+
 async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/dl <telegram_id> [projet] — Télécharge le code d'un bot utilisateur."""
     tid = update.effective_user.id
@@ -1268,68 +1393,26 @@ async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ ID invalide (doit être un nombre)."); return
 
-    pname = " ".join(args[1:]).strip() if len(args) > 1 else None
-    bots  = get_user_bots(target_tid)
+    pname  = " ".join(args[1:]).strip() if len(args) > 1 else None
+    bots   = get_user_bots(target_tid)
     if not bots:
-        await update.message.reply_text(f"⚠️ Aucun bot trouvé pour l'utilisateur <code>{target_tid}</code>.", parse_mode="HTML"); return
+        await update.message.reply_text(
+            f"⚠️ Aucun bot pour <code>{target_tid}</code>.", parse_mode="HTML"); return
 
     if pname:
         bot_row = next((b for b in bots if b["project_name"].lower() == pname.lower()), None)
         if not bot_row:
             names = ", ".join(f"<code>{b['project_name']}</code>" for b in bots)
             await update.message.reply_text(
-                f"❌ Projet « {pname} » introuvable.\nProjets disponibles : {names}", parse_mode="HTML"); return
+                f"❌ Projet « {pname} » introuvable.\nDisponibles : {names}",
+                parse_mode="HTML"); return
     else:
         bot_row = bots[0]
 
-    pname_actual = bot_row["project_name"]
-
-    # Construire un ZIP en mémoire avec main.py + fichiers supplémentaires
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # main.py (code principal)
-        main_py = bot_row.get("main_py") or ""
-        zf.writestr("main.py", main_py)
-        # Fichiers supplémentaires stockés en JSON
-        extra = bot_row.get("extra_files") or {}
-        if isinstance(extra, str):
-            try:
-                extra = json.loads(extra)
-            except Exception:
-                extra = {}
-        for fname, content in extra.items():
-            if isinstance(content, str):
-                zf.writestr(fname, content)
-        # Méta-infos
-        env_vars = bot_row.get("env_vars") or {}
-        if isinstance(env_vars, str):
-            try:
-                env_vars = json.loads(env_vars)
-            except Exception:
-                env_vars = {}
-        meta = (
-            f"# Projet   : {pname_actual}\n"
-            f"# UserID   : {target_tid}\n"
-            f"# Token    : {bot_row.get('api_token','???')}\n"
-            f"# Créé le  : {bot_row.get('date_creation','—')}\n"
-            f"# Statut   : {'🟢 actif' if bot_row.get('is_running') else '🔴 arrêté'}\n\n"
-            "# Variables d'environnement :\n" +
-            "\n".join(f"# {k}={v}" for k, v in env_vars.items()) + "\n"
-        )
-        zf.writestr("_META.txt", meta)
-    buf.seek(0)
-    safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in pname_actual)
+    buf, fname, caption = _build_project_zip(bot_row, target_tid)
     await update.message.reply_document(
-        document=buf,
-        filename=f"{safe_name}_{target_tid}.zip",
-        caption=(
-            f"📦 <b>Projet</b> : <code>{pname_actual}</code>\n"
-            f"👤 <b>User</b>   : <code>{target_tid}</code>\n"
-            f"📁 Contient : <code>main.py</code> + fichiers + <code>_META.txt</code>"
-        ),
-        parse_mode="HTML",
-    )
-    log_activity(tid, "admin_dl", f"{target_tid}/{pname_actual}")
+        document=buf, filename=fname, caption=caption, parse_mode="HTML")
+    log_activity(tid, "admin_dl", f"{target_tid}/{bot_row['project_name']}")
 
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1361,6 +1444,46 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(text) > 4000:
         text = text[:4000] + "\n…(tronqué)"
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def admin_dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback adl:{target_tid}:{project_name} — Télécharge le ZIP d'un projet via bouton inline."""
+    q   = update.callback_query
+    tid = update.effective_user.id
+    if not is_admin(tid):
+        await q.answer("❌ Accès refusé.", show_alert=True); return
+    await q.answer("⏳ Préparation du ZIP…")
+
+    parts = q.data.split(":", 2)   # ["adl", "TARGET_TID", "PROJECT_NAME"]
+    if len(parts) < 3:
+        await q.message.reply_text("❌ Données invalides."); return
+
+    try:
+        target_tid = int(parts[1])
+    except ValueError:
+        await q.message.reply_text("❌ ID utilisateur invalide."); return
+
+    pname_req = parts[2].strip()
+    bots = get_user_bots(target_tid)
+    if not bots:
+        await q.message.reply_text(
+            f"⚠️ Aucun bot trouvé pour <code>{target_tid}</code>.", parse_mode="HTML"); return
+
+    # Recherche par préfixe (on a pu tronquer le nom à 20 chars dans callback_data)
+    bot_row = next(
+        (b for b in bots if b["project_name"].startswith(pname_req)
+                         or b["project_name"] == pname_req),
+        None
+    )
+    if not bot_row:
+        names = ", ".join(f"<code>{b['project_name']}</code>" for b in bots)
+        await q.message.reply_text(
+            f"❌ Projet introuvable.\nDisponibles : {names}", parse_mode="HTML"); return
+
+    buf, fname, caption = _build_project_zip(bot_row, target_tid)
+    await q.message.reply_document(
+        document=buf, filename=fname, caption=caption, parse_mode="HTML")
+    log_activity(tid, "admin_dl", f"{target_tid}/{bot_row['project_name']}")
 
 
 async def back_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1599,6 +1722,7 @@ def main():
     app.add_handler(CallbackQueryHandler(del_no_callback,         pattern="^del_no$"))
     app.add_handler(CallbackQueryHandler(my_bots_list_callback,   pattern="^my_bots_list$"))
     app.add_handler(CallbackQueryHandler(admin_users_callback,    pattern="^admin_users$"))
+    app.add_handler(CallbackQueryHandler(admin_dl_callback,       pattern=r"^adl:.+$"))
     app.add_handler(CallbackQueryHandler(payer_info_callback,     pattern="^payer_info$"))
     app.add_handler(CallbackQueryHandler(pay_duration_callback,   pattern=r"^pay_dur:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_pro_callback,        pattern="^pay_pro$"))

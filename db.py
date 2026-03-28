@@ -3,6 +3,7 @@ db.py — Couche base de données du Bot Manager
 Tables : user_profiles, projects (multi-bots), bot_settings, activity_logs
 """
 import json
+import time
 import threading
 import psycopg2
 from psycopg2 import pool as _pg_pool
@@ -14,6 +15,35 @@ import config
 
 logger = logging.getLogger(__name__)
 DATABASE_URL = config.DATABASE_URL
+
+# ── Cache mémoire (évite les requêtes DB répétées dans un même flux) ──────────
+# Chaque entrée : {"data": ..., "ts": float(time.time())}
+_CACHE_TTL_PROFILE = 30   # secondes — profil utilisateur
+_CACHE_TTL_BOTS    = 15   # secondes — liste des bots (change plus souvent)
+
+_profile_cache: dict[int, dict] = {}
+_bots_cache:    dict[int, dict] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(store: dict, tid: int, ttl: float):
+    with _cache_lock:
+        entry = store.get(tid)
+    if entry and (time.time() - entry["ts"]) < ttl:
+        return entry["data"]
+    return None          # cache miss ou expiré
+
+
+def _cache_set(store: dict, tid: int, data):
+    with _cache_lock:
+        store[tid] = {"data": data, "ts": time.time()}
+
+
+def _cache_del(tid: int):
+    """Invalide profil + bots pour cet utilisateur (après toute écriture)."""
+    with _cache_lock:
+        _profile_cache.pop(tid, None)
+        _bots_cache.pop(tid, None)
 
 # ── Pool de connexions (évite d'ouvrir/fermer TCP à chaque requête) ───────────
 _pool: _pg_pool.ThreadedConnectionPool | None = None
@@ -274,12 +304,17 @@ def get_pro_price() -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_user_profile(telegram_id: int):
+    cached = _cache_get(_profile_cache, telegram_id, _CACHE_TTL_PROFILE)
+    if cached is not None:
+        return cached
     conn = get_connection()
     cur  = conn.cursor()
     cur.execute("SELECT * FROM user_profiles WHERE telegram_id = %s", (telegram_id,))
     row  = cur.fetchone()
     cur.close()
     conn.close()
+    if row is not None:
+        _cache_set(_profile_cache, telegram_id, row)
     return row
 
 def upsert_user_profile(telegram_id: int, nom: str = "", prenom: str = "",
@@ -304,6 +339,7 @@ def upsert_user_profile(telegram_id: int, nom: str = "", prenom: str = "",
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
     return row
 
 def give_free_trial(telegram_id: int):
@@ -318,6 +354,7 @@ def give_free_trial(telegram_id: int):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
 
 def is_subscription_active(telegram_id: int) -> bool:
     profile = get_user_profile(telegram_id)
@@ -363,6 +400,7 @@ def set_subscription(telegram_id: int, hours: int):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
     return row["subscription_end"] if row else None
 
 def set_subscription_days(telegram_id: int, days: int):
@@ -387,6 +425,7 @@ def set_pro_subscription(telegram_id: int, weeks: int):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
     return row["pro_subscription_end"] if row else None
 
 def revoke_subscription(telegram_id: int):
@@ -401,6 +440,7 @@ def revoke_subscription(telegram_id: int):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
 
 def get_all_profiles():
     conn = get_connection()
@@ -420,6 +460,7 @@ def delete_user(telegram_id: int):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -466,6 +507,7 @@ def save_bot(telegram_id: int, project_name: str, api_token: str,
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
     return row
 
 def get_bot(telegram_id: int, project_name: str):
@@ -479,6 +521,9 @@ def get_bot(telegram_id: int, project_name: str):
     return row
 
 def get_user_bots(telegram_id: int) -> list:
+    cached = _cache_get(_bots_cache, telegram_id, _CACHE_TTL_BOTS)
+    if cached is not None:
+        return cached
     conn = get_connection()
     cur  = conn.cursor()
     cur.execute("SELECT * FROM projects WHERE telegram_id=%s ORDER BY project_number ASC",
@@ -486,6 +531,7 @@ def get_user_bots(telegram_id: int) -> list:
     rows = cur.fetchall()
     cur.close()
     conn.close()
+    _cache_set(_bots_cache, telegram_id, rows)
     return rows
 
 def count_user_bots(telegram_id: int) -> int:
@@ -507,6 +553,7 @@ def set_bot_running(telegram_id: int, project_name: str, is_running: bool, pid: 
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)   # le statut bot a changé
 
 def set_all_bots_stopped(telegram_id: int):
     """Marque tous les bots d'un utilisateur comme arrêtés."""
@@ -517,6 +564,7 @@ def set_all_bots_stopped(telegram_id: int):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
 
 
 def get_bot_assigned_port(telegram_id: int, project_name: str) -> int | None:
@@ -609,6 +657,7 @@ def delete_bot(telegram_id: int, project_name: str):
     conn.commit()
     cur.close()
     conn.close()
+    _cache_del(telegram_id)
 
 def delete_project(telegram_id: int):
     """Compat. : supprime tous les bots ET le profil."""
