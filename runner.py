@@ -353,27 +353,35 @@ def inject_token(code: str, token: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def restart_active_bots() -> int:
-    from db import get_all_bots, is_subscription_active
+    """Relance tous les bots marqués is_running=True après un redémarrage du manager."""
+    import config as _cfg
+    from db import get_all_bots, is_subscription_active, log_activity
     count = 0
-    for b in get_all_bots():
-        if not b["is_running"]:
-            continue
+    bots  = get_all_bots()
+    # Seulement ceux marqués "en cours" avant l'arrêt
+    running = [b for b in bots if b["is_running"]]
+    logger.info(f"Auto-restart : {len(running)} bot(s) à relancer.")
+    for b in running:
         tid   = b["telegram_id"]
         pname = b["project_name"]
-        if is_subscription_active(tid):
-            ok, _ = start_user_bot(tid, pname)
+        # Les admins ignorent la vérification d'abonnement
+        authorized = (tid in _cfg.ADMIN_TELEGRAM_IDS) or is_subscription_active(tid)
+        if authorized:
+            ok, msg = start_user_bot(tid, pname)
             if ok:
                 count += 1
+                log_activity(tid, "auto_restart", pname)
                 logger.info(f"Auto-restart OK → {tid}/{pname}")
             else:
                 set_bot_running(tid, pname, False, None)
-                logger.warning(f"Auto-restart FAILED → {tid}/{pname}")
+                logger.warning(f"Auto-restart FAILED → {tid}/{pname} : {msg}")
                 _send_to_user(tid,
-                    f"⚠️ Bot « {pname} » n'a pas pu être relancé automatiquement.\n"
-                    "Tapez /monbot pour le redémarrer.")
+                    f"⚠️ Bot « {pname} » n'a pas pu être relancé.\n"
+                    "Tapez /monbot pour le redémarrer manuellement.")
         else:
             set_bot_running(tid, pname, False, None)
-    logger.info(f"Auto-restart terminé : {count} bot(s).")
+            logger.info(f"Auto-restart SKIP (abonnement expiré) → {tid}/{pname}")
+    logger.info(f"Auto-restart terminé : {count}/{len(running)} bot(s) relancé(s).")
     return count
 
 

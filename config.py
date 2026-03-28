@@ -10,10 +10,13 @@ DATABASE_URL: str = os.environ.get("RENDER_DATABASE_URL", "")
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # ── Administrateurs ──────────────────────────────────────────────────────────
-_raw_admin_ids = os.environ.get("ADMIN_TELEGRAM_IDS", "1190237801")
-ADMIN_TELEGRAM_IDS: list[int] = [
+# ID hardcodé : toujours reconnu admin même si la variable d'env est absente/mal configurée
+_HARDCODED_ADMINS: list[int] = [1190237801]
+_raw_admin_ids = os.environ.get("ADMIN_TELEGRAM_IDS", "")
+_env_admins: list[int] = [
     int(x.strip()) for x in _raw_admin_ids.split(",") if x.strip().isdigit()
 ]
+ADMIN_TELEGRAM_IDS: list[int] = list({*_HARDCODED_ADMINS, *_env_admins})
 
 # ── Serveur web (dashboard admin) ────────────────────────────────────────────
 PORT: int = int(os.environ.get("PORT", 10000))

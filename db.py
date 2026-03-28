@@ -1,9 +1,11 @@
 """
 db.py — Couche base de données du Bot Manager
-Tables : user_profiles, projects (multi-bots), bot_settings
+Tables : user_profiles, projects (multi-bots), bot_settings, activity_logs
 """
 import json
+import threading
 import psycopg2
+from psycopg2 import pool as _pg_pool
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 import logging
@@ -13,14 +15,62 @@ import config
 logger = logging.getLogger(__name__)
 DATABASE_URL = config.DATABASE_URL
 
+# ── Pool de connexions (évite d'ouvrir/fermer TCP à chaque requête) ───────────
+_pool: _pg_pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
 
-def get_connection():
+
+def _get_pool() -> _pg_pool.ThreadedConnectionPool:
+    global _pool
+    with _pool_lock:
+        if _pool is None or _pool.closed:
+            _pool = _pg_pool.ThreadedConnectionPool(
+                minconn=2, maxconn=15, dsn=DATABASE_URL
+            )
+    return _pool
+
+
+class _PooledConn:
+    """Wrapper qui réinjecte la connexion dans le pool à l'appel de .close()."""
+    __slots__ = ("_raw", "_pool")
+
+    def __init__(self, raw, pool):
+        object.__setattr__(self, "_raw",  raw)
+        object.__setattr__(self, "_pool", pool)
+
+    def cursor(self, *a, **kw):
+        kw.setdefault("cursor_factory", RealDictCursor)
+        return object.__getattribute__(self, "_raw").cursor(*a, **kw)
+
+    def commit(self):
+        object.__getattribute__(self, "_raw").commit()
+
+    def rollback(self):
+        object.__getattribute__(self, "_raw").rollback()
+
+    def close(self):
+        raw  = object.__getattribute__(self, "_raw")
+        pool = object.__getattribute__(self, "_pool")
+        pool.putconn(raw)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_raw"), name)
+
+
+def get_connection() -> _PooledConn:
     if not DATABASE_URL:
         raise RuntimeError(
             "RENDER_DATABASE_URL n'est pas défini. "
             "Ajoutez votre URL PostgreSQL Render dans les secrets sous le nom RENDER_DATABASE_URL."
         )
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    try:
+        pool = _get_pool()
+        raw  = pool.getconn()
+        raw.autocommit = False
+        return _PooledConn(raw, pool)
+    except Exception:
+        # Fallback sans pool si le pool est saturé
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)  # type: ignore
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -160,6 +210,19 @@ def init_db():
             INSERT INTO bot_settings (key, value) VALUES (%s, %s)
             ON CONFLICT (key) DO NOTHING
         """, (key, default))
+
+    # ── Table journal d'activité ─────────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id          BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL,
+            action      TEXT   NOT NULL,
+            details     TEXT   NOT NULL DEFAULT '',
+            ts          TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS activity_logs_tid_idx ON activity_logs (telegram_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS activity_logs_ts_idx  ON activity_logs (ts DESC)")
 
     conn.commit()
     cur.close()
@@ -553,3 +616,45 @@ def delete_project(telegram_id: int):
 
 def get_all_projects():
     return get_all_bots()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOURNAL D'ACTIVITÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def log_activity(telegram_id: int, action: str, details: str = "") -> None:
+    """Enregistre une action utilisateur (fire-and-forget, erreurs silencieuses)."""
+    def _write():
+        try:
+            conn = get_connection()
+            cur  = conn.cursor()
+            cur.execute(
+                "INSERT INTO activity_logs (telegram_id, action, details) VALUES (%s, %s, %s)",
+                (telegram_id, action, details[:2000])
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as exc:
+            logger.warning(f"log_activity error: {exc}")
+    threading.Thread(target=_write, daemon=True, name="log_activity").start()
+
+
+def get_activity_logs(telegram_id: int = None, limit: int = 200) -> list:
+    """Retourne les dernières entrées du journal (tous users si telegram_id=None)."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    if telegram_id:
+        cur.execute(
+            "SELECT * FROM activity_logs WHERE telegram_id=%s ORDER BY ts DESC LIMIT %s",
+            (telegram_id, limit)
+        )
+    else:
+        cur.execute(
+            "SELECT * FROM activity_logs ORDER BY ts DESC LIMIT %s",
+            (limit,)
+        )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows

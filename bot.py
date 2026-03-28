@@ -35,6 +35,8 @@ from db import (
     get_setting, set_setting, get_durations, get_pro_price,
     # Compat
     get_project,
+    # Journal
+    log_activity, get_activity_logs,
 )
 from runner import start_user_bot, stop_user_bot
 from analyzer import detect_local_dependencies
@@ -615,11 +617,13 @@ async def deploy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ *Démarrage en cours...*", parse_mode="Markdown")
     success, message = start_user_bot(tid, pname)
     if success:
+        log_activity(tid, "bot_start", pname)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⛔ Arrêter {pname}", callback_data=f"stop:{pname}")],
             [InlineKeyboardButton("📋 Mes bots", callback_data="my_bots_list")],
         ])
     else:
+        log_activity(tid, "bot_start_fail", f"{pname}: {message[:200]}")
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Réessayer", callback_data=f"deploy:{pname}")
         ]])
@@ -631,6 +635,8 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid   = update.effective_user.id
     pname = q.data.split(":", 1)[1] if ":" in q.data else None
     success, message = stop_user_bot(tid, pname)
+    if success:
+        log_activity(tid, "bot_stop", pname or "")
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"🚀 Relancer {pname}", callback_data=f"deploy:{pname}")
     ]])
@@ -791,6 +797,7 @@ async def payment_proof_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user    = update.effective_user
     nom_d   = f"{profile['prenom']} {profile['nom']}" if profile and profile.get("nom") else user.full_name
 
+    log_activity(tid, "payment_submitted", f"{label} ({price} F)")
     type_label = "⭐ Pro" if is_pro else "Standard"
     notif_text = (
         f"📸 *Preuve de paiement*\n\n"
@@ -841,9 +848,11 @@ async def pay_validate_admin_callback(update: Update, context: ContextTypes.DEFA
         weeks   = max(1, hours // 168)
         sub_end = set_pro_subscription(user_tid, weeks)
         label   = f"Pro {weeks} semaine(s)"
+        log_activity(user_tid, "subscription_pro", f"{weeks} semaine(s)")
     else:
         sub_end = set_subscription(user_tid, hours)
         label   = f"{hours}h"
+        log_activity(user_tid, "subscription_activated", f"{hours}h")
 
     exp_str = _sub_expire_str(sub_end) if sub_end else "—"
     await q.edit_message_caption(
@@ -895,25 +904,82 @@ async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     q = update.callback_query
     await q.answer()
     if not is_admin(update.effective_user.id):
-        await q.answer("❌", show_alert=True); return
+        await q.answer("❌ Accès refusé", show_alert=True); return
+
     profiles = get_all_profiles()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="back_home")]])
+
     if not profiles:
-        await q.edit_message_text("Aucun utilisateur.")
+        await q.edit_message_text("Aucun utilisateur enregistré.", reply_markup=kb)
         return
-    lines = [f"👥 *Utilisateurs ({len(profiles)}) :*\n"]
-    for p in profiles:
-        tid    = p["telegram_id"]
-        active = is_subscription_active(tid)
-        pro    = is_pro_active(tid)
-        nb     = count_user_bots(tid)
-        icons  = ("✅" if active else "⛔") + (" ⭐" if pro else "")
+
+    # Filtrer les admins de la liste affichée
+    users = [p for p in profiles if p["telegram_id"] not in config.ADMIN_TELEGRAM_IDS]
+
+    header = f"👥 <b>Utilisateurs ({len(users)})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    blocks = []
+
+    for p in users:
+        tid     = p["telegram_id"]
+        active  = is_subscription_active(tid)
+        pro     = is_pro_active(tid)
+        trial   = p.get("trial_used", False)
+        bots    = get_user_bots(tid)
+        nb      = len(bots)
         sub_end = p.get("subscription_end")
-        rem = _sub_remaining_str(sub_end) if active and sub_end else ("expiré" if sub_end else "aucun")
-        lines.append(f"{icons} *{p.get('prenom','')} {p.get('nom','')}*\n"
-                     f"   `{tid}` — {nb} bots — _{rem}_")
-    await q.edit_message_text("\n\n".join(lines), parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔙 Retour", callback_data="back_home")]]))
+        pro_end = p.get("pro_subscription_end")
+
+        # Statut abonnement
+        if pro and pro_end:
+            statut = f"⭐ Pro — <b>{_sub_remaining_str(pro_end)}</b> restant"
+        elif active and sub_end:
+            statut = f"✅ Actif — <b>{_sub_remaining_str(sub_end)}</b> restant"
+        elif sub_end:
+            statut = "⛔ Expiré (le " + _sub_expire_str(sub_end) + ")"
+        elif trial:
+            statut = "🎁 Essai utilisé"
+        else:
+            statut = "🆕 Aucun abonnement"
+
+        # Liste des bots
+        if bots:
+            bots_lines = "\n".join(
+                f"    {'🟢' if b['is_running'] else '🔴'} <code>{b['project_name']}</code>"
+                for b in bots
+            )
+        else:
+            bots_lines = "    <i>Aucun bot</i>"
+
+        name = f"{p.get('prenom', '')} {p.get('nom', '')}".strip() or "Sans nom"
+        blocks.append(
+            f"👤 <b>{name}</b>\n"
+            f"   ID : <code>{tid}</code> | {nb} bot(s)\n"
+            f"   {statut}\n"
+            f"{bots_lines}"
+        )
+
+    # Découper en messages de max 3900 chars pour rester sous la limite Telegram
+    full_text = header + "\n\n".join(blocks)
+    if len(full_text) <= 3900:
+        await q.edit_message_text(full_text, parse_mode="HTML", reply_markup=kb)
+    else:
+        # Premier message : modifier le message existant
+        chunk, rest = "", blocks[:]
+        await q.edit_message_text(header + "⏳ Chargement...", parse_mode="HTML")
+        current = header
+        msgs = []
+        for block in rest:
+            if len(current) + len(block) + 4 > 3900:
+                msgs.append(current)
+                current = ""
+            current += block + "\n\n"
+        if current:
+            msgs.append(current)
+
+        for i, msg in enumerate(msgs):
+            reply_markup = kb if i == len(msgs) - 1 else None
+            await q.message.reply_text(msg.strip(), parse_mode="HTML",
+                                        reply_markup=reply_markup)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1184,6 +1250,119 @@ async def dbinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 *Token dashboard :* `{config.DASHBOARD_SECRET}`",
         parse_mode="Markdown")
 
+async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dl <telegram_id> [projet] — Télécharge le code d'un bot utilisateur."""
+    tid = update.effective_user.id
+    if not is_admin(tid):
+        await update.message.reply_text("❌ Accès refusé."); return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "📥 <b>Usage :</b>\n"
+            "<code>/dl &lt;telegram_id&gt;</code>  → 1er bot\n"
+            "<code>/dl &lt;telegram_id&gt; &lt;nom_projet&gt;</code>  → projet précis\n\n"
+            "💡 <b>Exemple :</b> <code>/dl 123456789 MonBot</code>",
+            parse_mode="HTML"); return
+    try:
+        target_tid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID invalide (doit être un nombre)."); return
+
+    pname = " ".join(args[1:]).strip() if len(args) > 1 else None
+    bots  = get_user_bots(target_tid)
+    if not bots:
+        await update.message.reply_text(f"⚠️ Aucun bot trouvé pour l'utilisateur <code>{target_tid}</code>.", parse_mode="HTML"); return
+
+    if pname:
+        bot_row = next((b for b in bots if b["project_name"].lower() == pname.lower()), None)
+        if not bot_row:
+            names = ", ".join(f"<code>{b['project_name']}</code>" for b in bots)
+            await update.message.reply_text(
+                f"❌ Projet « {pname} » introuvable.\nProjets disponibles : {names}", parse_mode="HTML"); return
+    else:
+        bot_row = bots[0]
+
+    pname_actual = bot_row["project_name"]
+
+    # Construire un ZIP en mémoire avec main.py + fichiers supplémentaires
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # main.py (code principal)
+        main_py = bot_row.get("main_py") or ""
+        zf.writestr("main.py", main_py)
+        # Fichiers supplémentaires stockés en JSON
+        extra = bot_row.get("extra_files") or {}
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except Exception:
+                extra = {}
+        for fname, content in extra.items():
+            if isinstance(content, str):
+                zf.writestr(fname, content)
+        # Méta-infos
+        env_vars = bot_row.get("env_vars") or {}
+        if isinstance(env_vars, str):
+            try:
+                env_vars = json.loads(env_vars)
+            except Exception:
+                env_vars = {}
+        meta = (
+            f"# Projet   : {pname_actual}\n"
+            f"# UserID   : {target_tid}\n"
+            f"# Token    : {bot_row.get('api_token','???')}\n"
+            f"# Créé le  : {bot_row.get('date_creation','—')}\n"
+            f"# Statut   : {'🟢 actif' if bot_row.get('is_running') else '🔴 arrêté'}\n\n"
+            "# Variables d'environnement :\n" +
+            "\n".join(f"# {k}={v}" for k, v in env_vars.items()) + "\n"
+        )
+        zf.writestr("_META.txt", meta)
+    buf.seek(0)
+    safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in pname_actual)
+    await update.message.reply_document(
+        document=buf,
+        filename=f"{safe_name}_{target_tid}.zip",
+        caption=(
+            f"📦 <b>Projet</b> : <code>{pname_actual}</code>\n"
+            f"👤 <b>User</b>   : <code>{target_tid}</code>\n"
+            f"📁 Contient : <code>main.py</code> + fichiers + <code>_META.txt</code>"
+        ),
+        parse_mode="HTML",
+    )
+    log_activity(tid, "admin_dl", f"{target_tid}/{pname_actual}")
+
+
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/logs [telegram_id] — Affiche les 50 dernières activités."""
+    tid = update.effective_user.id
+    if not is_admin(tid):
+        await update.message.reply_text("❌ Accès refusé."); return
+    args = context.args or []
+    target = None
+    if args:
+        try:
+            target = int(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ ID invalide."); return
+
+    entries = get_activity_logs(telegram_id=target, limit=50)
+    if not entries:
+        await update.message.reply_text("📋 Aucune activité enregistrée.")
+        return
+    who = f"pour <code>{target}</code>" if target else "(tous les utilisateurs)"
+    lines = [f"📋 <b>Journal d'activité {who}</b> :\n"]
+    for e in entries:
+        ts  = e["ts"].strftime("%d/%m %H:%M") if e["ts"] else "—"
+        act = e["action"]
+        det = e["details"]
+        lines.append(f"<code>{ts}</code> | <code>{e['telegram_id']}</code> → <b>{act}</b>"
+                     + (f"\n  ↳ {det}" if det else ""))
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…(tronqué)"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 async def back_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1342,7 +1521,16 @@ def main():
     threading.Thread(target=_start_web_server, daemon=True, name="WebServer").start()
     logger.info(f"Dashboard démarré sur le port {config.PORT}")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(10)
+        .read_timeout(30)
+        .write_timeout(30)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
 
     # ConversationHandler unique gérant les deux flux + config admin
     conv = ConversationHandler(
@@ -1400,6 +1588,8 @@ def main():
     app.add_handler(CommandHandler("temps",        temps_command))
     app.add_handler(CommandHandler("utilisateurs", utilisateurs_command))
     app.add_handler(CommandHandler("dbinfo",       dbinfo_command))
+    app.add_handler(CommandHandler("dl",           dl_command))
+    app.add_handler(CommandHandler("logs",         logs_command))
 
     # Callbacks inline
     app.add_handler(CallbackQueryHandler(deploy_callback,         pattern=r"^deploy:.+$"))
