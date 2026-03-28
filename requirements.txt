@@ -1,5 +1,5 @@
 # ── Serveur Bot Manager ──────────────────────────────────────────────────────
-python-telegram-bot==21.3
+python-telegram-bot
 psycopg2-binary
 flask
 httpx
