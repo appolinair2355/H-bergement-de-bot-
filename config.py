@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # ── Administrateurs ──────────────────────────────────────────────────────────
 # ID hardcodé : toujours reconnu admin même si la variable d'env est absente/mal configurée
-_HARDCODED_ADMINS: list[int] = [1190237801]
+_HARDCODED_ADMINS: list[int] = [8649780855]
 _raw_admin_ids = os.environ.get("ADMIN_TELEGRAM_IDS", "")
 _env_admins: list[int] = [
     int(x.strip()) for x in _raw_admin_ids.split(",") if x.strip().isdigit()
