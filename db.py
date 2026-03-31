@@ -611,17 +611,29 @@ def get_all_bots() -> list:
     conn.close()
     return rows
 
-def get_expired_running_bots() -> list:
-    """Retourne tous les bots actifs dont l'abonnement a expiré."""
+def get_expired_running_bots(admin_ids: list = None) -> list:
+    """Retourne tous les bots actifs dont l'abonnement a expiré (exclut les admins)."""
     conn = get_connection()
     cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.telegram_id, p.project_name, p.pid, p.api_token
-        FROM projects p
-        JOIN user_profiles u ON u.telegram_id = p.telegram_id
-        WHERE p.is_running = TRUE
-          AND (u.subscription_end IS NULL OR u.subscription_end < NOW())
-    """)
+    # On exclut les admins — leurs bots tournent indéfiniment
+    if admin_ids:
+        placeholders = ",".join(["%s"] * len(admin_ids))
+        cur.execute(f"""
+            SELECT p.telegram_id, p.project_name, p.pid, p.api_token
+            FROM projects p
+            JOIN user_profiles u ON u.telegram_id = p.telegram_id
+            WHERE p.is_running = TRUE
+              AND p.telegram_id NOT IN ({placeholders})
+              AND (u.subscription_end IS NULL OR u.subscription_end < NOW())
+        """, admin_ids)
+    else:
+        cur.execute("""
+            SELECT p.telegram_id, p.project_name, p.pid, p.api_token
+            FROM projects p
+            JOIN user_profiles u ON u.telegram_id = p.telegram_id
+            WHERE p.is_running = TRUE
+              AND (u.subscription_end IS NULL OR u.subscription_end < NOW())
+        """)
     rows = cur.fetchall()
     cur.close()
     conn.close()

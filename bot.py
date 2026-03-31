@@ -138,6 +138,7 @@ def _red_panel(profile: dict, tid: int = None) -> tuple[str, InlineKeyboardMarku
     return msg, InlineKeyboardMarkup(rows)
 
 def _blue_panel(tid: int) -> tuple[str, InlineKeyboardMarkup]:
+    from db import get_bot_assigned_port
     profile = get_user_profile(tid) or {}
     sub_end = profile.get("subscription_end")
     pro_end = profile.get("pro_subscription_end")
@@ -153,8 +154,10 @@ def _blue_panel(tid: int) -> tuple[str, InlineKeyboardMarkup]:
 
     bots_lines = ""
     for b in bots:
-        ico = "🟢" if b["is_running"] else "🔴"
-        bots_lines += f"\n│   {ico} {b['project_name']}"
+        ico  = "🟢" if b["is_running"] else "🔴"
+        port = get_bot_assigned_port(tid, b["project_name"])
+        port_info = f" (port {port})" if (b["is_running"] and port) else ""
+        bots_lines += f"\n│   {ico} {b['project_name']}{port_info}"
 
     msg = (
         "🔵 *Tableau de bord — Abonnement actif*\n\n"
@@ -175,6 +178,7 @@ def _blue_panel(tid: int) -> tuple[str, InlineKeyboardMarkup]:
         btn2 = InlineKeyboardButton("🗑", callback_data=f"del_ask:{pname}")
         rows.append([btn1, btn2])
     rows.append([InlineKeyboardButton("➕ Ajouter un autre bot", callback_data="add_bot")])
+    rows.append([InlineKeyboardButton("💳 Renouveler l'abonnement", callback_data="payer_info")])
     return msg, InlineKeyboardMarkup(rows)
 
 
@@ -194,6 +198,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # ── ADMIN : panneau d'administration complet ──────────────────────────────
     if is_admin(tid):
+        from db import get_bot_assigned_port
         bots      = get_user_bots(tid)
         running_c = sum(1 for b in bots if b["is_running"])
         nb        = len(bots)
@@ -202,7 +207,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         bot_lines = ""
         for b in bots:
             ico = "🟢" if b["is_running"] else "🔴"
-            # Fichiers supplémentaires
             extra = b.get("extra_files") or {}
             if isinstance(extra, str):
                 try:
@@ -211,7 +215,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     extra = {}
             n_files = len(extra)
             file_info = f" (+{n_files} fichier{'s' if n_files > 1 else ''})" if n_files else ""
-            bot_lines += f"\n│ {ico} <b>{b['project_name']}</b>{file_info}"
+            port = get_bot_assigned_port(tid, b["project_name"])
+            port_info = f" <code>:{port}</code>" if (b["is_running"] and port) else ""
+            bot_lines += f"\n│ {ico} <b>{b['project_name']}</b>{file_info}{port_info}"
 
         msg = (
             "🔑 <b>Panneau Administrateur</b>\n\n"
@@ -284,12 +290,26 @@ async def begin_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     user    = update.effective_user
     profile = get_user_profile(tid)
 
+    # Nettoyer les données de la session précédente pour éviter les conflits
+    context.user_data.clear()
+
     # Enregistrer le nom Telegram automatiquement (sans le demander)
     tg_nom    = (user.last_name  or "").strip()
     tg_prenom = (user.first_name or "").strip()
     if not profile:
         give_free_trial(tid)
     upsert_user_profile(tid, nom=tg_nom, prenom=tg_prenom)
+
+    # Admin : bypass total des credentials, aller directement au nom du projet
+    if is_admin(tid):
+        context.user_data["is_returning"]     = True
+        context.user_data["profile_env_vars"] = {}
+        await q.edit_message_text(
+            "🔑 <b>Admin — Héberger un bot</b>\n\n"
+            "📋 <b>Nom de votre projet / bot ?</b>\n\n"
+            "<i>Ex : Mon Scraper, Bot Shop, Assistant...\n(Max 30 caractères)</i>",
+            parse_mode="HTML")
+        return PROJECT_NAME_STEP
 
     # Flux court UNIQUEMENT si API_ID déjà enregistré
     has_credentials = bool(
@@ -299,7 +319,7 @@ async def begin_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if has_credentials:
         # Utilisateur connu → flux court : nom projet → token → ZIP
-        context.user_data["is_returning"]    = True
+        context.user_data["is_returning"]     = True
         context.user_data["profile_env_vars"] = dict(profile.get("profile_env_vars") or {})
         await q.edit_message_text(
             "📋 *Nom de votre projet / bot ?*\n\n"
@@ -386,14 +406,23 @@ async def get_project_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Le nom ne peut pas être vide.")
         return PROJECT_NAME_STEP
 
-    # Vérifier si ce nom de projet existe déjà
+    # Vérifier si ce nom de projet existe déjà → demander confirmation explicite
     existing = get_bot(tid, name)
     if existing:
+        context.user_data["project_name_pending"] = name
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Oui, mettre à jour ce bot", callback_data=f"confirm_update:{name}")],
+            [InlineKeyboardButton("❌ Non, choisir un autre nom",  callback_data="cancel_update")],
+        ])
         await update.message.reply_text(
-            f"⚠️ Un bot nommé « *{name}* » existe déjà.\n\n"
-            "Continuer *mettra à jour* ce bot (nouveau ZIP + token).\n"
-            "Ou tapez un autre nom.",
-            parse_mode="Markdown")
+            f"⚠️ *Un bot nommé « {name} » existe déjà !*\n\n"
+            "Mettre à jour écrasera :\n"
+            f"• Le token actuel : `{existing['api_token'][:20]}...`\n"
+            "• Le code source\n"
+            "• Les variables d'environnement\n\n"
+            "Voulez-vous vraiment *remplacer* ce bot ?",
+            parse_mode="Markdown", reply_markup=kb)
+        return PROJECT_NAME_STEP
 
     context.user_data["project_name"] = name
     await update.message.reply_text(
@@ -402,6 +431,31 @@ async def get_project_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "_Obtenez un token via @BotFather sur Telegram._",
         parse_mode="Markdown")
     return API_TOKEN_STEP
+
+async def confirm_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """L'utilisateur confirme l'écrasement d'un bot existant."""
+    q = update.callback_query
+    await q.answer()
+    name = context.user_data.get("project_name_pending") or q.data.split(":", 1)[1]
+    context.user_data["project_name"] = name
+    context.user_data.pop("project_name_pending", None)
+    await q.edit_message_text(
+        f"✅ Mise à jour du bot *{name}* confirmée.\n\n"
+        "🔑 *Nouveau token API du bot ?*\n"
+        "_Obtenez un token via @BotFather sur Telegram._",
+        parse_mode="Markdown")
+    return API_TOKEN_STEP
+
+async def cancel_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """L'utilisateur annule et choisit un autre nom."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data.pop("project_name_pending", None)
+    await q.edit_message_text(
+        "📋 *Tapez un nouveau nom pour votre bot :*\n\n"
+        "_Le nom doit être unique (ex : MonBot2, AssistantV2...)_",
+        parse_mode="Markdown")
+    return PROJECT_NAME_STEP
 
 async def get_api_token_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     token = update.message.text.strip()
@@ -470,18 +524,29 @@ async def get_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await wait.edit_text("❌ ZIP invalide.")
         return ZIP_FILE
 
-    if "main.py" not in py_files:
+    # Détection automatique du fichier principal
+    MAIN_PRIORITY = ["main.py", "bot.py", "app.py", "index.py", "run.py", "start.py"]
+    main_filename = None
+    for candidate in MAIN_PRIORITY:
+        if candidate in py_files:
+            main_filename = candidate
+            break
+    if main_filename is None and py_files:
+        # Prendre le premier fichier alphabétiquement si aucun nom standard
+        main_filename = sorted(py_files.keys())[0]
+
+    if main_filename is None:
         await wait.edit_text(
-            "❌ Aucun `main.py` dans le ZIP.\n\nFichiers trouvés :\n"
-            + "\n".join(f"• `{f}`" for f in sorted(py_files)),
+            "❌ Aucun fichier Python `.py` trouvé dans le ZIP.\n\n"
+            "Vérifiez que votre archive contient bien au moins un fichier `.py`.",
             parse_mode="Markdown")
         return ZIP_FILE
 
-    main_code   = py_files.pop("main.py")
+    main_code   = py_files.pop(main_filename)
     extra_files = py_files
     _, pip_deps = detect_local_dependencies(main_code)
 
-    all_names = ["main.py"] + sorted(extra_files)
+    all_names = [main_filename] + sorted(extra_files)
     env_note  = " + `.env` ✅" if env_vars else ""
     pkg_str   = "  " + "\n  ".join(f"✅ `{p}`" for p in pip_deps) if pip_deps else "  Aucun détecté"
     await wait.edit_text(
@@ -595,35 +660,64 @@ async def env_var_done_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def _finalize_bot(update, context, main_code, extra_files, env_vars):
     tid          = update.effective_user.id
-    project_name = context.user_data["project_name"]
-    api_token    = context.user_data["api_token"]
+    project_name = context.user_data.get("project_name", "")
+    api_token    = context.user_data.get("api_token", "")
     profile      = get_user_profile(tid) or {}
     nom          = profile.get("nom", "")
     prenom       = profile.get("prenom", "")
-    msg          = update.effective_message   # fonctionne pour message ET callback
+    msg          = update.effective_message
 
-    # Vérification limite de bots
-    limit    = _bot_limit(tid)
-    nb_bots  = count_user_bots(tid)
-    existing = get_bot(tid, project_name)
-    if not existing and nb_bots >= limit:
-        if not is_pro_active(tid) and limit == config.MAX_BOTS_BASIC:
-            pro_price = get_pro_price()
-            kb = [[InlineKeyboardButton(
-                f"⭐ Passer Pro ({config.MAX_BOTS_PRO} bots) — {pro_price} F/sem",
-                callback_data="pay_pro")]]
-            await msg.reply_text(
-                f"⛔ <b>Limite atteinte : {config.MAX_BOTS_BASIC} bots</b>\n\n"
-                "Vous avez atteint la limite du plan standard.\n"
-                f"Passez au plan <b>Pro</b> pour héberger jusqu'à {config.MAX_BOTS_PRO} bots.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(kb))
-            return ConversationHandler.END
-        elif limit == config.MAX_BOTS_PRO:
-            await msg.reply_text(
-                f"⛔ <b>Limite Pro atteinte : {config.MAX_BOTS_PRO} bots.</b>\n\nContactez l'admin pour augmenter votre limite.",
-                parse_mode="HTML")
-            return ConversationHandler.END
+    # Validation basique des données
+    if not project_name or not api_token:
+        await msg.reply_text(
+            "❌ <b>Erreur de session.</b>\n\n"
+            "Les données de configuration sont incomplètes. "
+            "Tapez /start pour recommencer.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Retour", callback_data="back_home")
+            ]])
+        )
+        return ConversationHandler.END
+
+    if not main_code:
+        await msg.reply_text(
+            "❌ <b>Aucun code source.</b>\n\nTapez /start pour recommencer.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Retour", callback_data="back_home")
+            ]])
+        )
+        return ConversationHandler.END
+
+    # Vérification limite de bots (admins = illimité)
+    if not is_admin(tid):
+        limit    = _bot_limit(tid)
+        nb_bots  = count_user_bots(tid)
+        existing = get_bot(tid, project_name)
+        if not existing and nb_bots >= limit:
+            if not is_pro_active(tid) and limit == config.MAX_BOTS_BASIC:
+                pro_price = get_pro_price()
+                kb = [[InlineKeyboardButton(
+                    f"⭐ Passer Pro ({config.MAX_BOTS_PRO} bots) — {pro_price} F/sem",
+                    callback_data="pay_pro")],
+                    [InlineKeyboardButton("🏠 Retour", callback_data="back_home")]]
+                await msg.reply_text(
+                    f"⛔ <b>Limite atteinte : {config.MAX_BOTS_BASIC} bots</b>\n\n"
+                    "Vous avez atteint la limite du plan standard.\n"
+                    f"Passez au plan <b>Pro</b> pour héberger jusqu'à {config.MAX_BOTS_PRO} bots.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb))
+                return ConversationHandler.END
+            elif limit == config.MAX_BOTS_PRO:
+                await msg.reply_text(
+                    f"⛔ <b>Limite Pro atteinte : {config.MAX_BOTS_PRO} bots.</b>\n\n"
+                    "Contactez l'admin pour augmenter votre limite.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🏠 Retour", callback_data="back_home")
+                    ]]))
+                return ConversationHandler.END
 
     row = save_bot(tid, project_name, api_token, main_code,
                    extra_files, env_vars, nom, prenom)
@@ -634,24 +728,54 @@ async def _finalize_bot(update, context, main_code, extra_files, env_vars):
     if extra_files:
         extra_info = "├ 📎 Fichiers : " + ", ".join(f"<code>{f}</code>" for f in extra_files) + "\n"
 
-    summary = (
-        f"✅ <b>Bot « {project_name} » enregistré !</b>\n\n"
-        f"├ 👤 {nom} {prenom}\n"
-        f"├ 📁 Projet N°{pnum}\n"
-        f"├ 📅 {date_str}\n"
-        f"├ 🤖 Token : <code>{api_token[:15]}...</code>\n"
-        f"{extra_info}\n"
-        "Appuyez sur <b>Héberger</b> pour lancer votre bot."
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Héberger", callback_data=f"deploy:{project_name}")],
-        [InlineKeyboardButton("➕ Ajouter un autre bot", callback_data="add_bot")],
-    ])
-    await msg.reply_text(summary, parse_mode="HTML", reply_markup=kb)
+    # Démarrage automatique si admin ou abonnement actif
+    can_deploy = is_admin(tid) or is_subscription_active(tid)
+    if can_deploy:
+        summary_header = (
+            f"✅ <b>Bot « {project_name} » enregistré !</b>\n\n"
+            f"├ 📁 Projet N°{pnum}\n"
+            f"├ 📅 {date_str}\n"
+            f"├ 🤖 Token : <code>{api_token[:15]}...</code>\n"
+            f"{extra_info}\n"
+            "⏳ <b>Démarrage en cours...</b>"
+        )
+        await msg.reply_text(summary_header, parse_mode="HTML")
+        success, start_msg = start_user_bot(tid, project_name)
+        if success:
+            log_activity(tid, "bot_start", project_name)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⛔ Arrêter {project_name}", callback_data=f"stop:{project_name}")
+             if success else
+             InlineKeyboardButton(f"🔄 Réessayer", callback_data=f"deploy:{project_name}")],
+            [InlineKeyboardButton("📋 Mes bots", callback_data="my_bots_list")],
+            [InlineKeyboardButton("➕ Ajouter un autre bot", callback_data="add_bot")],
+        ])
+        await msg.reply_text(start_msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        # Pas encore d'abonnement → montrer le bouton payer
+        summary = (
+            f"✅ <b>Bot « {project_name} » enregistré !</b>\n\n"
+            f"├ 📁 Projet N°{pnum}\n"
+            f"├ 📅 {date_str}\n"
+            f"├ 🤖 Token : <code>{api_token[:15]}...</code>\n"
+            f"{extra_info}\n"
+            "⚠️ <b>Abonnement requis pour démarrer ce bot.</b>"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Payer pour démarrer", callback_data="payer_info")],
+            [InlineKeyboardButton("📋 Mes bots", callback_data="my_bots_list")],
+            [InlineKeyboardButton("➕ Ajouter un autre bot", callback_data="add_bot")],
+        ])
+        await msg.reply_text(summary, parse_mode="HTML", reply_markup=kb)
+
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Configuration annulée. Tapez /start.")
+    context.user_data.clear()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Retour à l'accueil", callback_data="back_home")]])
+    await update.message.reply_text(
+        "❌ Configuration annulée.",
+        reply_markup=kb)
     return ConversationHandler.END
 
 
@@ -727,55 +851,42 @@ async def del_yes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pname = q.data.split(":", 1)[1]
     # 1. Arrêter le bot si en cours d'exécution
     stop_user_bot(tid, pname)
-    # 2. Supprimer le fichier .py sur disque
-    safe = "".join(c if c.isalnum() or c == "_" else "_" for c in pname.lower())
+    # 2. Supprimer le fichier .py sur disque (dans user_bots/)
+    import re as _re
+    safe_slug = _re.sub(r"[^a-z0-9]+", "_", pname.lower().strip())[:24]
     bot_file = os.path.join(
-        os.path.dirname(__file__),
-        f"bot_{tid}_{safe}.py"
+        os.path.dirname(__file__), "user_bots",
+        f"bot_{tid}_{safe_slug}.py"
     )
     if os.path.exists(bot_file):
         os.remove(bot_file)
     # 3. Supprimer le ZIP sauvegardé
+    safe_zip = "".join(c if c.isalnum() or c == "_" else "_" for c in pname.lower())
     zip_file = os.path.join(
         os.path.dirname(__file__), "uploads",
-        f"{tid}_{safe}.zip"
+        f"{tid}_{safe_zip}.zip"
     )
     if os.path.exists(zip_file):
         os.remove(zip_file)
     # 4. Supprimer de la base de données
     delete_bot(tid, pname)
-    # 5. Retour au panel
-    msg = f"🗑 *Bot « {pname} » supprimé.*\n\n"
-    bots = get_user_bots(tid)
-    if bots:
-        msg2, kb2 = _blue_panel(tid)
-        await q.edit_message_text(msg + msg2, parse_mode="Markdown", reply_markup=kb2)
-    else:
-        kb2 = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Ajouter un bot", callback_data="begin_setup")
-        ]])
-        await q.edit_message_text(
-            msg + "_Vous n'avez plus de bots hébergés._",
-            parse_mode="Markdown", reply_markup=kb2)
+    # 5. Retour au panel (envoyer un nouveau message pour éviter conflit d'édition)
+    kb2 = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Retour à l'accueil", callback_data="back_home")]])
+    await q.edit_message_text(
+        f"🗑 <b>Bot « {pname} » supprimé.</b>\n\n"
+        "Appuyez sur le bouton ci-dessous pour retourner à l'accueil.",
+        parse_mode="HTML", reply_markup=kb2)
 
 async def del_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Annule la suppression, retourne au panel."""
     q = update.callback_query
     await q.answer("Suppression annulée.")
-    tid = update.effective_user.id
-    msg, kb = _blue_panel(tid)
-    await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
+    await back_home_callback(update, context)
 
 async def my_bots_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
-    tid = update.effective_user.id
-    if is_subscription_active(tid) or is_admin(tid):
-        msg, kb = _blue_panel(tid)
-    else:
-        profile = get_user_profile(tid)
-        msg, kb = _red_panel(profile or {})
-    await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
+    await back_home_callback(update, context)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1487,9 +1598,50 @@ async def admin_dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def back_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q   = update.callback_query
     await q.answer()
-    await q.edit_message_text("🏠 Tapez /start pour revenir à l'accueil.")
+    tid = update.effective_user.id
+    context.user_data.clear()
+    if is_admin(tid):
+        from db import get_bot_assigned_port
+        bots      = get_user_bots(tid)
+        running_c = sum(1 for b in bots if b["is_running"])
+        nb        = len(bots)
+        bot_lines = ""
+        for b in bots:
+            ico  = "🟢" if b["is_running"] else "🔴"
+            port = get_bot_assigned_port(tid, b["project_name"])
+            port_info = f" <code>:{port}</code>" if (b["is_running"] and port) else ""
+            bot_lines += f"\n│ {ico} <b>{b['project_name']}</b>{port_info}"
+        msg = (
+            "🔑 <b>Panneau Administrateur</b>\n\n"
+            f"├ 🤖 Mes bots ({nb}) :{bot_lines if bot_lines else ' <i>aucun</i>'}\n"
+            f"└ 🟢 En ligne : <b>{running_c}/{nb}</b>"
+        )
+        rows = []
+        for b in bots:
+            pname = b["project_name"]
+            btn_action = (
+                InlineKeyboardButton(f"⛔ {pname}", callback_data=f"stop:{pname}")
+                if b["is_running"] else
+                InlineKeyboardButton(f"🚀 {pname}", callback_data=f"deploy:{pname}")
+            )
+            btn_dl = InlineKeyboardButton("📥", callback_data=f"adl:{tid}:{pname}")
+            rows.append([btn_action, btn_dl])
+        rows += [
+            [InlineKeyboardButton("👥 Mes Utilisateurs",       callback_data="admin_users")],
+            [InlineKeyboardButton("➕ Héberger un Bot",         callback_data="begin_setup")],
+            [InlineKeyboardButton("⚙️ Config paiements",       callback_data="admin_pay_config")],
+            [InlineKeyboardButton("📖 Mode d'emploi",           callback_data="guide")],
+        ]
+        await q.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif is_subscription_active(tid):
+        msg, kb = _blue_panel(tid)
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        profile = get_user_profile(tid)
+        msg, kb = _red_panel(profile or {}, tid)
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1667,7 +1819,11 @@ def main():
             API_HASH_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_api_hash)],
             ADMIN_ID_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_admin_id_profile)],
             # Flux commun
-            PROJECT_NAME_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_project_name)],
+            PROJECT_NAME_STEP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_project_name),
+                CallbackQueryHandler(confirm_update_callback, pattern=r"^confirm_update:"),
+                CallbackQueryHandler(cancel_update_callback,  pattern=r"^cancel_update$"),
+            ],
             API_TOKEN_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_api_token_bot)],
             ZIP_FILE:       [MessageHandler(filters.Document.ALL, get_zip_file)],
             # Fenêtre variables d'environnement

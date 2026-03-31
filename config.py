@@ -4,7 +4,7 @@ config.py — Configuration centralisée du Bot Manager
 import os
 
 # ── Base de données (Render.com uniquement) ──────────────────────────────────
-DATABASE_URL: str = os.environ.get("RENDER_DATABASE_URL", "")
+DATABASE_URL: str = os.environ.get("RENDER_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
 
 # ── Telegram Bot ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -19,7 +19,7 @@ _env_admins: list[int] = [
 ADMIN_TELEGRAM_IDS: list[int] = list({*_HARDCODED_ADMINS, *_env_admins})
 
 # ── Serveur web (dashboard admin) ────────────────────────────────────────────
-PORT: int = int(os.environ.get("PORT", 10000))
+PORT: int = int(os.environ.get("PORT", 5000))
 DASHBOARD_SECRET: str = os.environ.get("DASHBOARD_SECRET", "botmanager_admin_2024")
 
 # ── Essai gratuit ────────────────────────────────────────────────────────────

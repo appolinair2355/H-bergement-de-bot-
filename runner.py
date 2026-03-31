@@ -25,7 +25,7 @@ USER_BOTS_DIR.mkdir(exist_ok=True)
 _send_message_callback = None
 
 # Port réservé par le dashboard (ne jamais le donner à un bot utilisateur)
-_DASHBOARD_PORT = int(os.environ.get("PORT", 10000))
+_DASHBOARD_PORT = int(os.environ.get("PORT", 5000))
 # Plage de ports attribués aux bots utilisateurs
 # Chaque utilisateur dispose d'un bloc de 20 ports
 _BOT_PORT_START = 11000
@@ -278,14 +278,16 @@ def start_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, st
             start_new_session=True,
         )
         set_bot_running(telegram_id, project_name, True, proc.pid)
-        logger.info(f"Started {telegram_id}/{project_name} PID={proc.pid}")
+        logger.info(f"Started {telegram_id}/{project_name} PID={proc.pid} PORT={dedicated_port}")
         threading.Thread(
             target=_monitor_process,
             args=(proc, telegram_id, project_name, api_token),
             daemon=True,
         ).start()
         return True, (
-            f"✅ *Bot « {project_name} » démarré !* (PID: {proc.pid})\n\n"
+            f"✅ *Bot « {project_name} » démarré !*\n\n"
+            f"├ PID : `{proc.pid}`\n"
+            f"└ Port : `{dedicated_port}`\n\n"
             "Démarrage en cours — vous recevrez un message de confirmation dans quelques secondes."
         )
     except Exception as e:
@@ -320,15 +322,27 @@ def stop_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, str
 
 
 def inject_token(code: str, token: str) -> str:
+    """
+    Injecte le token Telegram dans le code utilisateur.
+    Remplace uniquement les variables clairement liées à Telegram
+    (BOT_TOKEN, TELEGRAM_TOKEN, TOKEN — mais PAS API_TOKEN qui peut
+    désigner un token tiers comme OpenAI, CoinGecko, etc.).
+    """
+    # Variables d'affectation directe (ex : BOT_TOKEN = "...")
+    # N.B. : API_TOKEN volontairement exclu — trop générique
     var_patterns = [
-        r'((?:TOKEN|token|BOT_TOKEN|bot_token|TELEGRAM_TOKEN|telegram_token|API_TOKEN|api_token)\s*=\s*)["\'][^"\']*["\']',
-        r'(os\.environ\.get\(["\'](?:TOKEN|BOT_TOKEN|TELEGRAM_TOKEN|API_TOKEN)["\'],\s*)["\'][^"\']*["\']',
+        r'((?:TELEGRAM_BOT_TOKEN|TELEGRAM_TOKEN|telegram_token|BOT_TOKEN|bot_token)\s*=\s*)["\'][^"\']*["\']',
+        # TOKEN = "..." seulement si c'est seul (pas MYAPP_TOKEN, STRIPE_TOKEN, etc.)
+        r'(?<![A-Z_])(TOKEN\s*=\s*)["\'][^"\']*["\']',
+        # os.environ.get("BOT_TOKEN", ...) / os.environ.get("TOKEN", ...)
+        r'(os\.environ\.get\(["\'](?:TELEGRAM_BOT_TOKEN|TELEGRAM_TOKEN|BOT_TOKEN|TOKEN)["\'],\s*)["\'][^"\']*["\']',
     ]
+    # Patterns dans les appels de bibliothèques Telegram
     inline_patterns = [
-        r'(\.token\()["\'][^"\']*["\'](\))',
         r'(Bot\s*\(\s*token\s*=\s*)["\'][^"\']*["\']',
         r'(TelegramClient\s*\([^)]*bot_token\s*=\s*)["\'][^"\']*["\']',
         r'(Updater\s*\(["\'])[^"\']*(["\'])',
+        r'(ApplicationBuilder\s*\(\s*\)\s*\.token\s*\(\s*)["\'][^"\']*["\'](\s*\))',
     ]
     modified, found = code, False
     for p in var_patterns:
@@ -342,9 +356,15 @@ def inject_token(code: str, token: str) -> str:
                 return (g[0] + f'"{_t}"' + g[1]) if len(g) == 2 else (g[0] + f'"{_t}"')
             modified = re.sub(p, _r, modified)
             found = True
+    # Aucun pattern trouvé → injecter des variables en haut du fichier
+    # On n'inclut PAS API_TOKEN pour éviter d'écraser d'autres APIs
     if not found:
-        modified = (f'TOKEN="{token}"\nBOT_TOKEN="{token}"\n'
-                    f'TELEGRAM_TOKEN="{token}"\nAPI_TOKEN="{token}"\n\n') + code
+        modified = (
+            f'TOKEN="{token}"\n'
+            f'BOT_TOKEN="{token}"\n'
+            f'TELEGRAM_TOKEN="{token}"\n'
+            f'TELEGRAM_BOT_TOKEN="{token}"\n\n'
+        ) + code
     return modified
 
 
@@ -390,10 +410,11 @@ def restart_active_bots() -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _subscription_checker_loop():
+    import config as _cfg2
     logger.info("Subscription checker started.")
     while True:
         try:
-            for b in get_expired_running_bots():
+            for b in get_expired_running_bots(admin_ids=_cfg2.ADMIN_TELEGRAM_IDS):
                 tid   = b["telegram_id"]
                 pname = b["project_name"]
                 pid   = b.get("pid")
