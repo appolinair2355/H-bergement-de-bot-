@@ -924,8 +924,7 @@ async def _finalize_bot(update, context, main_code, extra_files, env_vars):
             + "\n⏳ <b>Démarrage en cours...</b>"
         )
         await msg.reply_text(summary_header, parse_mode="HTML")
-        loop = asyncio.get_event_loop()
-        success, start_msg = await loop.run_in_executor(None, start_user_bot, tid, project_name)
+        success, start_msg = await asyncio.to_thread(start_user_bot, tid, project_name)
         if success:
             log_activity(tid, "project_start", f"{deploy_type}:{project_name}")
         kb_rows = [
@@ -985,8 +984,7 @@ async def deploy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.edit_message_text("⏳ *Démarrage en cours...*", parse_mode="Markdown")
-    loop = asyncio.get_event_loop()
-    success, message = await loop.run_in_executor(None, start_user_bot, tid, pname)
+    success, message = await asyncio.to_thread(start_user_bot, tid, pname)
     if success:
         log_activity(tid, "bot_start", pname)
         kb = InlineKeyboardMarkup([
@@ -1218,8 +1216,7 @@ async def get_modify_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         "⏳ Relancement en cours...",
         parse_mode="HTML")
 
-    loop = asyncio.get_event_loop()
-    success, start_msg = await loop.run_in_executor(None, start_user_bot, tid, pname)
+    success, start_msg = await asyncio.to_thread(start_user_bot, tid, pname)
     if success:
         log_activity(tid, "bot_start", pname)
     kb = InlineKeyboardMarkup([
