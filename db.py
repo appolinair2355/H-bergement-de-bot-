@@ -241,6 +241,13 @@ def init_db():
             ON CONFLICT (key) DO NOTHING
         """, (key, default))
 
+    # ── Colonnes supplémentaires user_profiles ───────────────────────────────
+    cur.execute("ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE")
+
+    # ── Colonnes supplémentaires projects ────────────────────────────────────
+    cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_type TEXT NOT NULL DEFAULT 'bot'")
+    cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS website_url  TEXT DEFAULT NULL")
+
     # ── Table journal d'activité ─────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS activity_logs (
@@ -462,6 +469,38 @@ def delete_user(telegram_id: int):
     conn.close()
     _cache_del(telegram_id)
 
+def block_user(telegram_id: int):
+    """Bloque un utilisateur (empêche toute interaction)."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO user_profiles (telegram_id, is_blocked)
+        VALUES (%s, TRUE)
+        ON CONFLICT (telegram_id) DO UPDATE SET is_blocked = TRUE
+    """, (telegram_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    _cache_del(telegram_id)
+
+def unblock_user(telegram_id: int):
+    """Débloque un utilisateur."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute("UPDATE user_profiles SET is_blocked = FALSE WHERE telegram_id = %s",
+                (telegram_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    _cache_del(telegram_id)
+
+def is_user_blocked(telegram_id: int) -> bool:
+    """Vérifie si un utilisateur est bloqué."""
+    profile = get_user_profile(telegram_id)
+    if not profile:
+        return False
+    return bool(profile.get("is_blocked", False))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BOTS (projets multi-bots)
@@ -478,8 +517,9 @@ def _next_project_number() -> int:
 
 def save_bot(telegram_id: int, project_name: str, api_token: str,
              main_py: str, extra_files: dict = None, env_vars: dict = None,
-             nom: str = "", prenom: str = ""):
-    """Sauvegarde un bot (upsert par telegram_id + project_name)."""
+             nom: str = "", prenom: str = "",
+             project_type: str = "bot", website_url: str = None):
+    """Sauvegarde un bot ou site web (upsert par telegram_id + project_name)."""
     conn       = get_connection()
     cur        = conn.cursor()
     proj_num   = _next_project_number()
@@ -488,8 +528,8 @@ def save_bot(telegram_id: int, project_name: str, api_token: str,
     cur.execute("""
         INSERT INTO projects
             (project_number, telegram_id, project_name, nom, prenom,
-             api_token, main_py, extra_files, env_vars)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+             api_token, main_py, extra_files, env_vars, project_type, website_url)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (telegram_id, project_name) DO UPDATE SET
             api_token    = EXCLUDED.api_token,
             main_py      = EXCLUDED.main_py,
@@ -497,12 +537,38 @@ def save_bot(telegram_id: int, project_name: str, api_token: str,
             env_vars     = EXCLUDED.env_vars,
             nom          = EXCLUDED.nom,
             prenom       = EXCLUDED.prenom,
+            project_type = EXCLUDED.project_type,
+            website_url  = EXCLUDED.website_url,
             date_creation = NOW(),
             is_running   = FALSE,
             pid          = NULL
         RETURNING project_number, date_creation
     """, (proj_num, telegram_id, project_name, nom, prenom,
-          api_token, main_py, extra_json, env_json))
+          api_token, main_py, extra_json, env_json, project_type, website_url))
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    _cache_del(telegram_id)
+    return row
+
+def update_bot_code(telegram_id: int, project_name: str,
+                    main_py: str, extra_files: dict = None, env_vars: dict = None):
+    """Met à jour uniquement le code source et les variables d'un bot existant."""
+    conn       = get_connection()
+    cur        = conn.cursor()
+    extra_json = json.dumps(extra_files or {})
+    env_json   = json.dumps(env_vars   or {})
+    cur.execute("""
+        UPDATE projects
+        SET main_py     = %s,
+            extra_files = %s,
+            env_vars    = %s,
+            is_running  = FALSE,
+            pid         = NULL
+        WHERE telegram_id = %s AND project_name = %s
+        RETURNING project_number, date_creation
+    """, (main_py, extra_json, env_json, telegram_id, project_name))
     row = cur.fetchone()
     conn.commit()
     cur.close()
@@ -699,6 +765,52 @@ def log_activity(telegram_id: int, action: str, details: str = "") -> None:
         except Exception as exc:
             logger.warning(f"log_activity error: {exc}")
     threading.Thread(target=_write, daemon=True, name="log_activity").start()
+
+
+def get_deployment_stats() -> dict:
+    """Retourne les statistiques globales de déploiement pour le panel admin."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT
+            COUNT(*)                                          AS total_projects,
+            COUNT(*) FILTER (WHERE project_type = 'bot')     AS total_bots,
+            COUNT(*) FILTER (WHERE project_type = 'website') AS total_websites,
+            COUNT(*) FILTER (WHERE is_running = TRUE)        AS running_total,
+            COUNT(*) FILTER (WHERE is_running = TRUE AND project_type = 'bot')     AS running_bots,
+            COUNT(*) FILTER (WHERE is_running = TRUE AND project_type = 'website') AS running_websites
+        FROM projects
+    """)
+    proj_stats = dict(cur.fetchone())
+
+    cur.execute("SELECT COUNT(*) AS total_users FROM user_profiles")
+    proj_stats["total_users"] = cur.fetchone()["total_users"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS total_deployments
+        FROM activity_logs
+        WHERE action IN ('bot_start', 'project_start', 'auto_restart')
+    """)
+    proj_stats["total_deployments"] = cur.fetchone()["total_deployments"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS total_today
+        FROM activity_logs
+        WHERE action IN ('bot_start', 'project_start', 'auto_restart')
+          AND ts >= NOW() - INTERVAL '24 hours'
+    """)
+    proj_stats["deployments_today"] = cur.fetchone()["total_today"]
+
+    cur.execute("""
+        SELECT COUNT(DISTINCT telegram_id) AS active_subscribers
+        FROM user_profiles
+        WHERE subscription_end > NOW() OR pro_subscription_end > NOW()
+    """)
+    proj_stats["active_subscribers"] = cur.fetchone()["active_subscribers"]
+
+    cur.close()
+    conn.close()
+    return proj_stats
 
 
 def get_activity_logs(telegram_id: int = None, limit: int = 200) -> list:

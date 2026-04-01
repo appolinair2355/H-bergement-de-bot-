@@ -1,24 +1,38 @@
 services:
   - type: web
     name: telegram-bot-manager
-    env: python
+    runtime: python
     region: frankfurt
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python3 bot.py
     healthCheckPath: /health
+
     envVars:
+      # ── Version Python ────────────────────────────────────────────────────
       - key: PYTHON_VERSION
         value: "3.11.9"
-      - key: PORT
-        value: "10000"
-      - key: ADMIN_TELEGRAM_IDS
-        value: "1190237801"
+
+      # ── Telegram ──────────────────────────────────────────────────────────
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
+        sync: false          # à renseigner dans Render → Environment
+
+      # ── Base de données PostgreSQL ────────────────────────────────────────
+      # Coller l'Internal Database URL de votre base Render Postgres ici,
+      # OU renseigner DATABASE_URL en secret dans Render → Environment.
       - key: RENDER_DATABASE_URL
         sync: false
-      - key: PAYMENT_INFO
-        sync: false
+
+      # ── Dashboard admin ───────────────────────────────────────────────────
+      # Accès : https://<service>.onrender.com/?token=<DASHBOARD_SECRET>
       - key: DASHBOARD_SECRET
+        sync: false          # choisissez un token aléatoire solide
+
+      # ── Administrateurs Telegram ──────────────────────────────────────────
+      # Votre Telegram ID (séparés par des virgules si plusieurs)
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false          # ex : 8649780855
+
+      # ── Instructions de paiement (optionnel) ──────────────────────────────
+      - key: PAYMENT_INFO
         sync: false

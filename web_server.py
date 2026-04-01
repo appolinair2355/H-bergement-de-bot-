@@ -1,14 +1,19 @@
 """
 web_server.py — Panneau d'administration Bot Manager
-Accessible sur : https://<votre-app>.onrender.com/?token=<DASHBOARD_SECRET>
+Dashboard : https://<app>.replit.dev/?token=<DASHBOARD_SECRET>
+Sites web : https://<app>.replit.dev/site/<telegram_id>/<slug>/
 """
 import json
 import os
+import re
+import time
+import requests as _requests
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, render_template_string, send_file, abort
+from flask import Flask, request, jsonify, render_template_string, send_file, abort, Response, stream_with_context
 
 import config
-from db import get_all_projects, get_project, set_subscription, revoke_subscription, is_subscription_active
+from db import (get_all_projects, get_project, set_subscription, revoke_subscription,
+                is_subscription_active, get_bot, get_bot_assigned_port, get_user_bots)
 from runner import stop_user_bot
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -282,7 +287,6 @@ def download_zip(tid: int, safe_name: str):
     """Téléchargement du ZIP d'un bot — admin seulement."""
     if not _auth(request):
         abort(403)
-    # Sécuriser le nom pour éviter les traversées de répertoire
     safe = "".join(c if c.isalnum() or c == "_" else "_" for c in safe_name)
     path = os.path.join(UPLOAD_DIR, f"{tid}_{safe}.zip")
     if not os.path.exists(path):
@@ -292,4 +296,128 @@ def download_zip(tid: int, safe_name: str):
         as_attachment=True,
         download_name=f"bot_{tid}_{safe}.zip",
         mimetype="application/zip",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROXY INVERSE — Sites web hébergés
+# URL :  /site/<telegram_id>/<slug>/          (sans auth — public)
+#        /site/<telegram_id>/<slug>/<path>
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SLUG_RE = re.compile(r"^[a-z0-9_]{1,48}$")
+
+def _safe_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.lower().strip())[:48]
+
+
+def _proxy_error(title: str, detail: str, code: int = 502):
+    return (
+        f"<html><body style='background:#0f1117;color:#e2e8f0;"
+        f"font-family:system-ui;display:flex;align-items:center;"
+        f"justify-content:center;height:100vh;'>"
+        f"<div style='text-align:center;max-width:480px'>"
+        f"<h2 style='margin-bottom:10px'>{title}</h2>"
+        f"<p style='color:#8892a4'>{detail}</p>"
+        f"</div></body></html>",
+        code,
+    )
+
+
+@app.route("/site/<int:tid>/<slug>/", defaults={"path": ""}, methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
+@app.route("/site/<int:tid>/<slug>/<path:path>",            methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
+def proxy_site(tid: int, slug: str, path: str):
+    """Proxy transparent vers le site web de l'utilisateur (port interne)."""
+    if not _SLUG_RE.match(slug):
+        return _proxy_error("❌ Nom de projet invalide", "L'identifiant du projet contient des caractères non autorisés.", 400)
+
+    # Rechercher le projet dans la DB (par slug = safe project_name)
+    try:
+        bots = get_user_bots(tid)
+        project = None
+        for b in bots:
+            if _safe_slug(b["project_name"]) == slug:
+                project = b
+                break
+    except Exception as e:
+        return _proxy_error("❌ Erreur base de données", str(e), 503)
+
+    if not project:
+        return _proxy_error(
+            "❌ Projet introuvable",
+            f"Aucun projet <code>{slug}</code> pour cet utilisateur.",
+            404,
+        )
+
+    if project.get("project_type", "bot") != "website":
+        return _proxy_error("❌ Pas un site web", "Ce projet est un bot Telegram, pas un site web.", 400)
+
+    if not project.get("is_running"):
+        return _proxy_error(
+            "⚠️ Site hors ligne",
+            "Ce site n'est pas démarré. Lancez-le via le bot manager.",
+            503,
+        )
+
+    # Récupérer le port assigné
+    port = get_bot_assigned_port(tid, project["project_name"])
+    if not port:
+        return _proxy_error("⚠️ Port non assigné", "Le site n'a pas encore de port attribué. Redémarrez-le.", 503)
+
+    # Construire l'URL cible
+    target_url = f"http://127.0.0.1:{port}/{path}"
+    if request.query_string:
+        target_url += "?" + request.query_string.decode("utf-8", errors="replace")
+
+    # Forwarder la requête
+    headers = {k: v for k, v in request.headers if k.lower() not in
+               ("host", "content-length", "transfer-encoding", "connection")}
+    headers["X-Forwarded-For"]   = request.remote_addr or ""
+    headers["X-Forwarded-Proto"] = request.scheme
+    headers["X-Real-IP"]         = request.remote_addr or ""
+
+    req_body = request.get_data()
+
+    # Tentatives avec délai — gère le cas où le site vient juste de démarrer
+    _MAX_RETRIES  = 5
+    _RETRY_DELAYS = [1, 1, 2, 2, 2]  # secondes entre chaque essai
+
+    last_error = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = _requests.request(
+                method  = request.method,
+                url     = target_url,
+                headers = headers,
+                data    = req_body,
+                cookies = request.cookies,
+                allow_redirects = False,
+                timeout = 30,
+                stream  = True,
+            )
+            # Nettoyer les headers de la réponse
+            excluded = {"transfer-encoding", "connection", "content-encoding"}
+            out_headers = [(k, v) for k, v in resp.raw.headers.items()
+                           if k.lower() not in excluded]
+            return Response(
+                stream_with_context(resp.iter_content(chunk_size=4096)),
+                status  = resp.status_code,
+                headers = out_headers,
+            )
+        except _requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_RETRY_DELAYS[attempt])
+            continue
+        except _requests.exceptions.Timeout:
+            return _proxy_error("⏱ Délai dépassé", "Le site n'a pas répondu dans les délais.", 504)
+        except Exception as e:
+            return _proxy_error("❌ Erreur proxy", str(e), 502)
+
+    # Toutes les tentatives ont échoué
+    return _proxy_error(
+        "⚠️ Site inaccessible",
+        f"Le site sur le port {port} ne répond pas après {_MAX_RETRIES} tentatives. "
+        "Il a peut-être planté — redémarrez-le via le bot manager.",
+        502,
     )

@@ -147,7 +147,8 @@ def _install_packages(packages: list[str], telegram_id: int) -> bool:
 
 
 def _monitor_process(proc: subprocess.Popen, telegram_id: int,
-                      project_name: str, api_token: str):
+                      project_name: str, api_token: str,
+                      project_type: str = "bot"):
     stderr_output, stdout_output = [], []
 
     def read_stderr():
@@ -161,7 +162,8 @@ def _monitor_process(proc: subprocess.Popen, telegram_id: int,
     t_err = threading.Thread(target=read_stderr, daemon=True)
     t_out = threading.Thread(target=read_stdout, daemon=True)
     t_err.start(); t_out.start()
-    time.sleep(8)
+    # Attente réduite : 4 s suffisent pour détecter un crash immédiat
+    time.sleep(4)
 
     if proc.poll() is not None:
         set_bot_running(telegram_id, project_name, False, None)
@@ -172,20 +174,35 @@ def _monitor_process(proc: subprocess.Popen, telegram_id: int,
         if missing_pkgs:
             installed = _install_packages(missing_pkgs, telegram_id)
             if installed:
-                _send_to_user(telegram_id, "🔄 *Redémarrage de votre bot...*")
+                _send_to_user(telegram_id, "🔄 *Redémarrage en cours...*")
                 success, message = start_user_bot(telegram_id, project_name)
                 _send_to_user(telegram_id, message)
                 return
 
-        err_preview = (all_output[-1000:] if all_output
-                       else "Aucun détail. Vérifiez votre `.env`.")
+        err_preview = (all_output[-900:] if all_output
+                       else "Aucun détail disponible. Vérifiez votre code ou votre `.env`.")
+        type_label  = "🌐 Site" if project_type == "website" else "🤖 Bot"
         _send_to_user(telegram_id,
-            f"❌ *Bot « {project_name} » planté (code {proc.returncode})*\n\n"
+            f"❌ *{type_label} « {project_name} » planté (code {proc.returncode})*\n\n"
             f"```\n{err_preview}\n```\n\n"
-            "Reconfigurez via /start → Hébergement.")
+            "Corrigez le code et utilisez ✏️ pour re-déployer.")
     else:
-        logger.info(f"Bot {telegram_id}/{project_name} (PID {proc.pid}) running ✓")
-        _send_welcome_via_user_bot(api_token, telegram_id, project_name)
+        logger.info(f"Project {telegram_id}/{project_name} (PID {proc.pid}) running ✓")
+        if project_type == "website":
+            _send_website_online_msg(telegram_id, project_name)
+        else:
+            _send_welcome_via_user_bot(api_token, telegram_id, project_name)
+
+
+def _send_website_online_msg(owner_tid: int, project_name: str):
+    """Notifie le propriétaire que son site web est en ligne via le bot manager."""
+    _send_to_user(owner_tid,
+        f"🌐 *Site « {project_name} » en ligne !*\n\n"
+        "Démarré avec succès — il est accessible et actif.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🏆 *Plateforme d'hébergement de*\n"
+        "*Sossou Kouamé Appolinaire* 🏆\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
 def _send_welcome_via_user_bot(api_token: str, owner_tid: int, project_name: str):
@@ -217,39 +234,58 @@ def start_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, st
         from db import get_user_bots
         bots = get_user_bots(telegram_id)
         if not bots:
-            return False, "❌ Aucun bot trouvé pour cet utilisateur."
+            return False, "❌ Aucun projet trouvé pour cet utilisateur."
         project_name = bots[0]["project_name"]
 
     project = get_bot(telegram_id, project_name)
     if not project:
-        return False, f"❌ Bot « {project_name} » introuvable."
+        return False, f"❌ Projet « {project_name} » introuvable."
 
     if project["is_running"] and project["pid"]:
         try:
             os.kill(project["pid"], 0)
-            return False, f"⚠️ Le bot « {project_name} » est déjà actif."
+            return False, f"⚠️ Le projet « {project_name} » est déjà actif."
         except ProcessLookupError:
             set_bot_running(telegram_id, project_name, False, None)
 
-    api_token = project["api_token"]
-    main_code = project["main_py"]
-    bot_file  = get_user_bot_path(telegram_id, project_name)
+    api_token    = project.get("api_token", "") or ""
+    main_code    = project["main_py"]
+    project_type = project.get("project_type", "bot") or "bot"
+    bot_file     = get_user_bot_path(telegram_id, project_name)
 
-    bot_file.write_text(inject_token(main_code, api_token), encoding="utf-8")
+    # Écrire le fichier principal
+    if project_type == "website":
+        # Site web → injection du PORT uniquement (pas de token Telegram)
+        bot_file.write_text(inject_port(main_code), encoding="utf-8")
+    elif not api_token:
+        bot_file.write_text(main_code, encoding="utf-8")
+    else:
+        bot_file.write_text(inject_token(main_code, api_token), encoding="utf-8")
 
     # Extra files
     extra = project.get("extra_files") or {}
     if isinstance(extra, str):
-        extra = _json.loads(extra)
+        try:
+            extra = _json.loads(extra)
+        except Exception:
+            extra = {}
     for fname, content in extra.items():
-        (USER_BOTS_DIR / fname).write_text(inject_token(content, api_token), encoding="utf-8")
+        if project_type == "website":
+            (USER_BOTS_DIR / fname).write_text(inject_port(content), encoding="utf-8")
+        elif not api_token:
+            (USER_BOTS_DIR / fname).write_text(content, encoding="utf-8")
+        else:
+            (USER_BOTS_DIR / fname).write_text(inject_token(content, api_token), encoding="utf-8")
 
     # Env vars
     env_vars = project.get("env_vars") or {}
     if isinstance(env_vars, str):
-        env_vars = _json.loads(env_vars)
+        try:
+            env_vars = _json.loads(env_vars)
+        except Exception:
+            env_vars = {}
 
-    # Pré-install packages
+    # Pré-install packages (non-bloquant)
     try:
         from analyzer import detect_local_dependencies
         _, pip_deps = detect_local_dependencies(main_code)
@@ -259,16 +295,19 @@ def start_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, st
         logger.warning(f"Pre-install check failed: {e}")
 
     env = os.environ.copy()
-    # Port fixe dédié à ce bot (persisté en DB, jamais partagé avec un autre bot)
     dedicated_port = _get_dedicated_port(telegram_id, project_name)
-    env["PORT"] = str(dedicated_port)
-    logger.info(f"Port attribué au bot {telegram_id}/{project_name}: {dedicated_port}")
-    env.update({"TOKEN": api_token, "BOT_TOKEN": api_token,
-                 "TELEGRAM_TOKEN": api_token, "API_TOKEN": api_token})
+    logger.info(f"Port attribué au projet {telegram_id}/{project_name}: {dedicated_port}")
+
+    if api_token:
+        env.update({"TOKEN": api_token, "BOT_TOKEN": api_token,
+                    "TELEGRAM_TOKEN": api_token, "TELEGRAM_BOT_TOKEN": api_token})
     for k, v in env_vars.items():
         env[k] = str(v)
+    # PORT forcé en dernier — ne peut pas être écrasé par les env_vars utilisateur
+    env["PORT"] = str(dedicated_port)
     env["PYTHONPATH"] = str(USER_BOTS_DIR) + ":" + env.get("PYTHONPATH", "")
 
+    type_label = "🌐 Site" if project_type == "website" else "🤖 Bot"
     try:
         proc = subprocess.Popen(
             ["python3", str(bot_file)],
@@ -278,17 +317,17 @@ def start_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, st
             start_new_session=True,
         )
         set_bot_running(telegram_id, project_name, True, proc.pid)
-        logger.info(f"Started {telegram_id}/{project_name} PID={proc.pid} PORT={dedicated_port}")
+        logger.info(f"Started {telegram_id}/{project_name} [{project_type}] PID={proc.pid} PORT={dedicated_port}")
         threading.Thread(
             target=_monitor_process,
-            args=(proc, telegram_id, project_name, api_token),
+            args=(proc, telegram_id, project_name, api_token, project_type),
             daemon=True,
         ).start()
         return True, (
-            f"✅ *Bot « {project_name} » démarré !*\n\n"
+            f"✅ *{type_label} « {project_name} » démarré !*\n\n"
             f"├ PID : `{proc.pid}`\n"
             f"└ Port : `{dedicated_port}`\n\n"
-            "Démarrage en cours — vous recevrez un message de confirmation dans quelques secondes."
+            "⏳ Confirmation dans quelques secondes..."
         )
     except Exception as e:
         logger.error(f"Start error {telegram_id}/{project_name}: {e}")
@@ -319,6 +358,31 @@ def stop_user_bot(telegram_id: int, project_name: str = None) -> tuple[bool, str
     set_bot_running(telegram_id, project_name, False, None)
     logger.info(f"Stopped {telegram_id}/{project_name} PID={pid}")
     return True, f"✅ Bot « {project_name} » arrêté."
+
+
+def inject_port(code: str) -> str:
+    """
+    Remplace les assignations PORT = <nombre> codées en dur par
+    PORT = int(os.environ.get("PORT", <nombre>)) afin que le runner
+    puisse imposer le port via la variable d'environnement.
+    Laisse intactes les lignes qui lisent déjà os.environ.
+    """
+    import re as _re
+
+    # Ne rien faire si PORT est déjà lu depuis os.environ
+    if _re.search(r'os\.environ.*PORT', code):
+        return code
+
+    # PORT = <entier>  →  PORT = int(os.environ.get("PORT", <entier>))
+    pattern = r'^([ \t]*PORT\s*=\s*)(\d+)([ \t]*)$'
+    replacement = r'PORT = int(os.environ.get("PORT", \2))'
+    new_code, n = _re.subn(pattern, replacement, code, flags=_re.MULTILINE)
+
+    if n == 0:
+        # Aucun PORT trouvé → injecter une ligne en haut
+        new_code = 'import os; PORT = int(os.environ.get("PORT", 10000))\n' + code
+
+    return new_code
 
 
 def inject_token(code: str, token: str) -> str:
